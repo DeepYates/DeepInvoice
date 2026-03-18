@@ -5,7 +5,7 @@ HubSpot Commerce Hub invoices via the API.
 
 Run: streamlit run streamlit_ar.py
 """
-import os, json, secrets, urllib.parse, requests
+import os, json, secrets, hashlib, urllib.parse, requests
 from pathlib import Path
 from datetime import date, timedelta
 
@@ -55,12 +55,16 @@ def save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 # ── OAuth helpers ──────────────────────────────────────────────────────────────
-def oauth_auth_url(state: str) -> str:
+def _oauth_state() -> str:
+    """Deterministic state token derived from the client secret — survives server restarts."""
+    return hashlib.sha256(f"ar-oauth-{OAUTH_CLIENT_SECRET}".encode()).hexdigest()[:32]
+
+def oauth_auth_url() -> str:
     return "https://app.hubspot.com/oauth/authorize?" + urllib.parse.urlencode({
         "client_id":    OAUTH_CLIENT_ID,
         "redirect_uri": OAUTH_REDIRECT_URI,
         "scope":        OAUTH_SCOPES,
-        "state":        state,
+        "state":        _oauth_state(),
     })
 
 def oauth_exchange_code(code: str) -> dict:
@@ -91,11 +95,7 @@ def render_login_page():
     st.markdown("Sign in with your HubSpot account to continue.")
     st.divider()
 
-    if "oauth_state" not in st.session_state:
-        st.session_state["oauth_state"] = secrets.token_urlsafe(16)
-
-    auth_url = oauth_auth_url(st.session_state["oauth_state"])
-    st.link_button("Sign in with HubSpot", auth_url, type="primary")
+    st.link_button("Sign in with HubSpot", oauth_auth_url(), type="primary")
     st.caption("You'll be redirected to HubSpot to authorize access.")
 
 # ── HubSpot helpers ────────────────────────────────────────────────────────────
@@ -1175,9 +1175,8 @@ def main():
         if "code" in params and not st.session_state.get("authenticated"):
             code          = params["code"]
             returned_state = params.get("state", "")
-            expected_state = st.session_state.get("oauth_state", "")
 
-            if returned_state != expected_state:
+            if returned_state != _oauth_state():
                 st.error("Invalid state parameter — possible CSRF attempt. Please try again.")
                 st.query_params.clear()
                 st.stop()
@@ -1219,7 +1218,7 @@ def main():
         if OAUTH_CLIENT_ID and st.session_state.get("user_email"):
             st.caption(f"Signed in as {st.session_state['user_email']}")
             if st.button("Sign out"):
-                for k in ("authenticated", "user_email", "hub_id", "oauth_state"):
+                for k in ("authenticated", "user_email", "hub_id"):
                     st.session_state.pop(k, None)
                 st.rerun()
         else:

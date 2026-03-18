@@ -694,7 +694,10 @@ def render_dashboard(deals: list[dict]):
 
                 # Aging: open invoices only
                 if status in OPEN_STATUSES:
-                    total_overdue_count += (1 if status == "OVERDUE" else 0)
+                    is_overdue = (status == "OVERDUE") or (
+                        due_s and due_s < today.isoformat()
+                    )
+                    total_overdue_count += (1 if is_overdue else 0)
                     if not due_s:
                         aging["Current"] += amt
                     else:

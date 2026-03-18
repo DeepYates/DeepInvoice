@@ -279,11 +279,13 @@ def aggregate_invoices(invoices: list[dict]) -> tuple[float, float, float, int]:
             continue
         amt = float(p.get("hs_amount_billed") or 0)
         if status in OPEN_STATUSES:
-            open_t += amt
+            open_t   += amt
+            billed_t += amt
         elif status in PAID_STATUSES:
-            paid_t += amt
-        billed_t += amt
-        count    += 1
+            paid_t   += amt
+            billed_t += amt
+        # Unknown statuses are counted but not added to billed totals
+        count += 1
     return open_t, paid_t, billed_t, count
 
 def count_draft_invoices(invoices: list[dict]) -> int:

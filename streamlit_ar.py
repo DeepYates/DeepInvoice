@@ -260,6 +260,15 @@ def get_unit_price(props: dict, quantity: float) -> float:
         return amount / quantity
     return 0.0
 
+@st.cache_data(ttl=3600)
+def fetch_portal_id() -> str:
+    """Returns the HubSpot portal (hub) ID for constructing CRM URLs."""
+    resp = requests.get(f"{BASE_URL}/integrations/v1/me", headers=HEADERS)
+    if resp.ok:
+        return str(resp.json().get("portalId", ""))
+    return ""
+
+
 def aggregate_invoices(invoices: list[dict]) -> tuple[float, float, float, int]:
     open_t = paid_t = billed_t = 0.0
     count  = 0
@@ -1155,6 +1164,8 @@ def render_history_tab(deal_id: str, state: dict):
     }
     today_str = date.today().isoformat()
 
+    portal_id = st.session_state.get("hub_id") or fetch_portal_id()
+
     st.subheader("HubSpot Invoices")
     if not invoices:
         st.info("No invoices found for this deal.")
@@ -1172,6 +1183,9 @@ def render_history_tab(deal_id: str, state: dict):
             else:
                 display_status = _STATUS_BADGE.get(status, status)
             inv_link = p.get("hs_invoice_link", "")
+            # Fallback to CRM URL when hs_invoice_link is empty (e.g. paid invoices)
+            if not inv_link and portal_id:
+                inv_link = f"https://app.hubspot.com/invoices/{portal_id}/view/{inv['id']}"
             rows.append({
                 "Invoice ID": inv["id"],
                 "Number":     p.get("hs_number", ""),

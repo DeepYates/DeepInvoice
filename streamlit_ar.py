@@ -544,11 +544,11 @@ def render_deal_details_panel(deal_data: dict, state: dict):
         st.caption(p["description"])
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Deal Amount",  f"${p['amount']:,.2f}")
-    c2.metric("Billed",       f"${p['billed']:,.2f}")
-    c3.metric("Open",         f"${p['open']:,.2f}")
-    c4.metric("Paid",         f"${p['paid']:,.2f}")
-    c5.metric("Remaining",    f"${p['remaining']:,.2f}")
+    c1.metric("Deal Amount",  f"${p['amount']:,.0f}")
+    c2.metric("Billed",       f"${p['billed']:,.0f}")
+    c3.metric("Open",         f"${p['open']:,.0f}")
+    c4.metric("Paid",         f"${p['paid']:,.0f}")
+    c5.metric("Remaining",    f"${p['remaining']:,.0f}")
 
     st.markdown("**Line Items**")
     try:
@@ -584,9 +584,9 @@ def render_deal_details_panel(deal_data: dict, state: dict):
                 "Type":       TYPE_DISPLAY.get(li_type_key, "Standard"),
                 "Qty":        f"{qty:g}",
                 "Unit Price": f"${unit_p:,.4f}",
-                "Contract":   f"${contract_total:,.2f}",
-                "Billed":     f"${billed_amt:,.2f}",
-                "Remaining":  f"${remaining_amt:,.2f}",
+                "Contract":   f"${contract_total:,.0f}",
+                "Billed":     f"${billed_amt:,.0f}",
+                "Remaining":  f"${remaining_amt:,.0f}",
                 "Note":       note,
             })
         st.dataframe(li_rows, use_container_width=True, hide_index=True)
@@ -713,11 +713,11 @@ def render_summary(deals: list[dict], state: dict):
     for dd in visible_deals:
         cols = st.columns(_COL_W)
         cols[0].write(dd["name"])
-        cols[1].write(f"${dd['amount']:,.2f}")
-        cols[2].write(f"${dd['billed']:,.2f}")
-        cols[3].write(f"${dd['open']:,.2f}")
-        cols[4].write(f"${dd['paid']:,.2f}")
-        rem_str = f"${dd['remaining']:,.2f}"
+        cols[1].write(f"${dd['amount']:,.0f}")
+        cols[2].write(f"${dd['billed']:,.0f}")
+        cols[3].write(f"${dd['open']:,.0f}")
+        cols[4].write(f"${dd['paid']:,.0f}")
+        rem_str = f"${dd['remaining']:,.0f}"
         cols[5].write(f"**{rem_str}**" if dd["remaining"] <= 0 else rem_str)
         cols[6].write(str(dd["count"]))
         draft_str = str(dd["drafts"]) if dd["drafts"] else "—"
@@ -872,7 +872,7 @@ def render_configure_tab(deal_id: str, line_items: list[dict], state: dict):
         cols[0].write(f"**{name}**")
         cols[1].write(f"${unit_p:,.2f}")
         cols[2].write(f"×{qty:g}")
-        cols[3].write(f"${total:,.2f}")
+        cols[3].write(f"${total:,.0f}")
         chosen = cols[4].selectbox(
             "Type", LINE_ITEM_TYPES,
             index=LINE_ITEM_TYPES.index(cur_display),
@@ -916,10 +916,10 @@ def render_create_invoice_tab(deal_id: str, line_items: list[dict], state: dict)
     remaining   = deal_amount - paid
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Deal Amount",  f"${deal_amount:,.2f}")
-    c2.metric("Total Billed", f"${billed:,.2f}")
-    c3.metric("Total Paid",   f"${paid:,.2f}")
-    c4.metric("Remaining",    f"${remaining:,.2f}")
+    c1.metric("Deal Amount",  f"${deal_amount:,.0f}")
+    c2.metric("Total Billed", f"${billed:,.0f}")
+    c3.metric("Total Paid",   f"${paid:,.0f}")
+    c4.metric("Remaining",    f"${remaining:,.0f}")
 
     st.divider()
     st.subheader("Invoice Builder")
@@ -928,6 +928,16 @@ def render_create_invoice_tab(deal_id: str, line_items: list[dict], state: dict)
     if unconfigured:
         st.info("Some line items are uncategorized — they will be treated as Standard. "
                 "Go to **Configure Line Items** to set their types.")
+
+    if st.button("Bill All Remaining", key=f"bill_all_btn_{deal_id}"):
+        for li in line_items:
+            _id   = li["id"]
+            _type = li_types.get(_id, "standard")
+            if _type == "mileage":
+                st.session_state[f"mi_all_{_id}"] = True
+            elif _type not in ("subscription", "data"):
+                st.session_state[f"std_all_{_id}"] = True
+        st.rerun()
 
     invoice_lines = []
 
@@ -951,13 +961,21 @@ def render_create_invoice_tab(deal_id: str, line_items: list[dict], state: dict)
                 f"Billed to date: {billed_miles:g} mi  ·  "
                 f"Remaining: {remaining_m:g} mi"
             )
-            miles_input = st.number_input(
-                "Miles to bill this invoice",
-                min_value=0.0, max_value=float(max(remaining_m, 0)),
-                value=0.0, step=1.0, key=f"miles_{li_id}"
+            mi_all = st.checkbox(
+                "Bill all remaining",
+                value=(remaining_m > 0),
+                key=f"mi_all_{li_id}",
             )
-            calc_amount = round(unit_p * miles_input, 2)
-            st.write(f"→ Amount: **${calc_amount:,.2f}**")
+            if mi_all:
+                miles_input = remaining_m
+            else:
+                miles_input = st.number_input(
+                    "Miles to bill this invoice",
+                    min_value=0.0, max_value=float(max(remaining_m, 0)),
+                    value=0.0, step=1.0, key=f"miles_{li_id}"
+                )
+            calc_amount = round(unit_p * miles_input)
+            st.write(f"→ {miles_input:g} mi  ·  **${calc_amount:,.0f}**")
             if miles_input > 0:
                 invoice_lines.append({
                     "li_id":       li_id,
@@ -975,7 +993,7 @@ def render_create_invoice_tab(deal_id: str, line_items: list[dict], state: dict)
             freq_label  = "/yr" if li_type == "subscription" else "/mo"
             prev_count  = inv_data.get("count", 0)
             prev_amt    = inv_data.get("amount", 0.0)
-            caption     = (f"Previously invoiced {prev_count}×  ·  ${prev_amt:,.2f} total"
+            caption     = (f"Previously invoiced {prev_count}×  ·  ${prev_amt:,.0f} total"
                            if prev_count else "Not yet invoiced")
             include = st.toggle(
                 f"Include: **{name}** — ${unit_p:,.2f}{freq_label}  ({label_type})",
@@ -1003,9 +1021,9 @@ def render_create_invoice_tab(deal_id: str, line_items: list[dict], state: dict)
 
             st.markdown(f"**{name}** — Standard  (${unit_p:,.4f}/unit)")
             st.caption(
-                f"Contract: {qty:g} unit(s) · ${contract_total:,.2f}  ·  "
-                f"Billed: {billed_qty:g} · ${prev_amt:,.2f}  ·  "
-                f"Remaining: {remaining_qty:g} · ${remaining_amt:,.2f}"
+                f"Contract: {qty:g} unit(s) · ${contract_total:,.0f}  ·  "
+                f"Billed: {billed_qty:g} · ${prev_amt:,.0f}  ·  "
+                f"Remaining: {remaining_qty:g} · ${remaining_amt:,.0f}"
             )
 
             bill_all = st.checkbox(
@@ -1024,8 +1042,8 @@ def render_create_invoice_tab(deal_id: str, line_items: list[dict], state: dict)
                     step=1.0,
                     key=f"std_qty_{li_id}",
                 )
-            bill_amt = round(unit_p * bill_qty, 2)
-            st.write(f"→ {bill_qty:g} unit(s)  ·  **${bill_amt:,.2f}**")
+            bill_amt = round(unit_p * bill_qty)
+            st.write(f"→ {bill_qty:g} unit(s)  ·  **${bill_amt:,.0f}**")
 
             if bill_qty > 0:
                 invoice_lines.append({
@@ -1041,7 +1059,7 @@ def render_create_invoice_tab(deal_id: str, line_items: list[dict], state: dict)
 
     st.divider()
     invoice_total = sum(l["amount"] for l in invoice_lines)
-    st.metric("Invoice Total", f"${invoice_total:,.2f}")
+    st.metric("Invoice Total", f"${invoice_total:,.0f}")
 
     due_date = st.date_input("Due Date", value=date.today() + timedelta(days=30))
 
@@ -1074,12 +1092,12 @@ def render_create_invoice_tab(deal_id: str, line_items: list[dict], state: dict)
                 "Type":        TYPE_DISPLAY.get(l["li_type"], l["li_type"].title()),
                 "Unit Price":  f"${l['unit_price']:,.4f}",
                 "Qty":         qty_label,
-                "Amount":      f"${l['amount']:,.2f}",
+                "Amount":      f"${l['amount']:,.0f}",
             })
         st.dataframe(confirm_rows, use_container_width=True, hide_index=True)
 
         c1, c2 = st.columns(2)
-        c1.metric("Invoice Total", f"${pending['total']:,.2f}")
+        c1.metric("Invoice Total", f"${pending['total']:,.0f}")
         c2.metric("Due Date", str(pending["due_date"]))
 
         memo = st.text_area("Memo / notes", value=pending.get("memo", ""),
@@ -1189,7 +1207,7 @@ def render_history_tab(deal_id: str, state: dict):
                 "Invoice ID": inv["id"],
                 "Number":     p.get("hs_number", ""),
                 "Status":     display_status,
-                "Amount":     f"${float(p.get('hs_amount_billed') or 0):,.2f}",
+                "Amount":     f"${float(p.get('hs_amount_billed') or 0):,.0f}",
                 "Created":    (p.get("hs_createdate") or "")[:10],
                 "Due":        due_date_str,
                 "Link":       inv_link,
@@ -1209,7 +1227,7 @@ def render_history_tab(deal_id: str, state: dict):
                 st.markdown(f"**Line Item ID: {li_id}**")
                 mile_rows = [
                     {"Invoice ID": e["invoice_id"], "Miles": e["miles"],
-                     "Amount": f"${e['amount']:,.2f}", "Date": e["date"]}
+                     "Amount": f"${e['amount']:,.0f}", "Date": e["date"]}
                     for e in entries
                 ]
                 st.dataframe(mile_rows, use_container_width=True)
@@ -1234,7 +1252,7 @@ def _render_draft_invoice_row(draft: dict):
     cols = st.columns([1.0, 1.4, 1.0, 1.1, 0.7, 0.85, 0.65])
     cols[0].write(draft["number"] or inv_id[:10])
     cols[1].write(due_display)
-    cols[2].write(f"${draft['amount']:,.2f}")
+    cols[2].write(f"${draft['amount']:,.0f}")
     cols[3].write(draft["created"][:10] if draft["created"] else "—")
 
     if cols[4].button("Edit", key=f"edit_btn_{inv_id}"):
@@ -1277,7 +1295,7 @@ def _render_draft_invoice_row(draft: dict):
                     "Name":   l["properties"].get("name", ""),
                     "Qty":    l["properties"].get("quantity", ""),
                     "Price":  f"${float(l['properties'].get('price') or 0):,.4f}",
-                    "Amount": f"${float(l['properties'].get('amount') or 0):,.2f}",
+                    "Amount": f"${float(l['properties'].get('amount') or 0):,.0f}",
                 } for l in li]
                 st.dataframe(li_rows, use_container_width=True, hide_index=True)
             else:

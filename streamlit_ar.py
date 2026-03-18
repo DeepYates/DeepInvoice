@@ -961,6 +961,96 @@ def render_summary(deals: list[dict], state: dict):
                 "They will no longer appear here after the next refresh."
             )
 
+# ── Global line-item type config page ─────────────────────────────────────────
+def render_global_line_item_config(deals: list[dict], state: dict):
+    st.header("Line Item Types")
+    st.caption(
+        "Set the billing type for each line item name. Changes apply across all "
+        "deals and all users. The Configure tab on individual deals is an optional override."
+    )
+
+    li_types = state["line_item_types"]
+
+    try:
+        ensure_li_type_property()
+    except Exception:
+        pass
+
+    # Collect all line items across all deals, grouped by name
+    name_map: dict[str, dict] = {}  # name → {type, li_ids, deal_names}
+
+    with st.spinner("Loading line items across all deals…"):
+        for d in deals:
+            deal_id   = d["id"]
+            deal_name = d.get("properties", {}).get("dealname") or deal_id
+            try:
+                items = fetch_line_items_for_deal(deal_id)
+            except Exception:
+                continue
+            for li in items:
+                li_id  = li["id"]
+                props  = li.get("properties", {})
+                name   = (props.get("name") or li_id).strip()
+                # Resolve type: local state → HubSpot property → default
+                hs_type = (props.get("ar_li_type") or "").strip().lower()
+                resolved = li_types.get(li_id) or (hs_type if hs_type in TYPE_KEY_MAP.values() else None)
+                entry = name_map.setdefault(name, {"type": None, "mixed": False,
+                                                    "li_ids": [], "deal_names": []})
+                entry["li_ids"].append(li_id)
+                if deal_name not in entry["deal_names"]:
+                    entry["deal_names"].append(deal_name)
+                if resolved:
+                    if entry["type"] is None:
+                        entry["type"] = resolved
+                    elif entry["type"] != resolved:
+                        entry["mixed"] = True
+
+    if not name_map:
+        st.info("No line items found across any deals.")
+        return
+
+    st.markdown(f"**{len(name_map)} unique line item name(s)** found across {len(deals)} deals.")
+    st.divider()
+
+    updated: dict[str, str] = {}  # name → new type key
+
+    for name, entry in sorted(name_map.items()):
+        cur_type    = entry["type"] or "standard"
+        cur_display = TYPE_DISPLAY.get(cur_type, "Standard")
+        mixed_note  = "  *(mixed — override below)*" if entry["mixed"] else ""
+        deal_note   = ", ".join(entry["deal_names"][:3])
+        if len(entry["deal_names"]) > 3:
+            deal_note += f" +{len(entry['deal_names']) - 3} more"
+
+        cols = st.columns([3, 2, 2])
+        cols[0].markdown(f"**{name}**{mixed_note}")
+        cols[1].caption(deal_note)
+        chosen = cols[2].selectbox(
+            "Type",
+            LINE_ITEM_TYPES,
+            index=LINE_ITEM_TYPES.index(cur_display),
+            key=f"global_type_{name}",
+            label_visibility="collapsed",
+        )
+        updated[name] = TYPE_KEY_MAP[chosen]
+
+    st.divider()
+    if st.button("Save All", type="primary"):
+        changed_ids: dict[str, str] = {}  # li_id → type
+        for name, new_type in updated.items():
+            for li_id in name_map[name]["li_ids"]:
+                changed_ids[li_id] = new_type
+
+        save_li_types_to_hubspot(changed_ids)
+        li_types.update(changed_ids)
+        save_state(state)
+        fetch_line_items_for_deal.clear()
+
+        n_names = len(updated)
+        n_ids   = len(changed_ids)
+        st.success(f"Saved types for {n_names} name(s) across {n_ids} line item(s).")
+
+
 # ── Line-item type config — HubSpot-backed ─────────────────────────────────────
 @st.cache_data(ttl=3600)
 def ensure_li_type_property() -> bool:
@@ -1700,6 +1790,12 @@ def main():
             st.session_state.pop("selected_deal_id", None)
             st.rerun()
 
+        if st.button("⚙️ Line Item Types",
+                     type="primary" if current_view == "li_config" else "secondary"):
+            st.session_state["view"] = "li_config"
+            st.session_state.pop("selected_deal_id", None)
+            st.rerun()
+
     with st.spinner("Loading deals..."):
         try:
             deals = fetch_closed_won_deals()
@@ -1722,6 +1818,10 @@ def main():
         render_dashboard(deals)
         return
 
+    if view == "li_config":
+        render_global_line_item_config(deals, state)
+        return
+
     if view == "drafts":
         st.header("Draft Invoices")
         render_drafts_view(deal_lookup)
@@ -1742,8 +1842,7 @@ def main():
     deal_name = d.get("properties", {}).get("dealname") or f"Deal {selected_id}"
     st.header(f"Deal: {deal_name}")
 
-    if st.session_state.pop("goto_invoice_tab", False):
-        st.info("Click the **Create Invoice** tab to build and send an invoice for this deal.")
+    st.session_state.pop("goto_invoice_tab", False)  # consumed; Create Invoice is now default tab
 
     with st.spinner("Loading line items..."):
         try:
@@ -1755,22 +1854,23 @@ def main():
     if not line_items:
         st.warning("No line items found for this deal.")
 
-    tab1, tab2, tab3 = st.tabs(["Configure Line Items", "Create Invoice", "Invoice History"])
+    tab1, tab2, tab3 = st.tabs(["Create Invoice", "Invoice History", "Configure Line Items"])
 
     with tab1:
-        if line_items:
-            render_configure_tab(selected_id, line_items, state)
-        else:
-            st.info("No line items to configure.")
-
-    with tab2:
         if line_items:
             render_create_invoice_tab(selected_id, line_items, state)
         else:
             st.info("No line items found. Cannot create invoice.")
 
-    with tab3:
+    with tab2:
         render_history_tab(selected_id, state)
+
+    with tab3:
+        st.caption("Override the globally-configured type for individual line items on this deal.")
+        if line_items:
+            render_configure_tab(selected_id, line_items, state)
+        else:
+            st.info("No line items to configure.")
 
 
 if __name__ == "__main__":

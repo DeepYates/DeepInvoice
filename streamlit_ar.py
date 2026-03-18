@@ -150,7 +150,8 @@ def fetch_line_items_for_deal(deal_id: str) -> list[dict]:
 
     # Step 2: batch read line item properties
     read_url = f"{BASE_URL}/crm/v3/objects/line_items/batch/read"
-    props    = ["name", "quantity", "price", "amount", "hs_unit_price", "description"]
+    props    = ["name", "quantity", "price", "amount", "hs_unit_price", "description",
+                "ar_li_type"]
     resp = requests.post(read_url, headers=HEADERS, json={
         "inputs":     [{"id": str(x)} for x in li_ids],
         "properties": props,
@@ -513,6 +514,14 @@ def render_deal_details_panel(deal_data: dict, state: dict):
     li_types = state["line_item_types"]
     p = deal_data
 
+    # Ensure li_types is seeded from HubSpot for any items not in local state
+    try:
+        line_items_preview = fetch_line_items_for_deal(p["id"])
+        if seed_li_types_from_hubspot(line_items_preview, li_types):
+            save_state(state)
+    except Exception:
+        pass
+
     meta_parts = []
     if p.get("pipeline"):
         meta_parts.append(f"**Pipeline:** {p['pipeline']}")
@@ -768,9 +777,65 @@ def render_summary(deals: list[dict], state: dict):
                 "They will no longer appear here after the next refresh."
             )
 
+# ── Line-item type config — HubSpot-backed ─────────────────────────────────────
+@st.cache_data(ttl=3600)
+def ensure_li_type_property() -> bool:
+    """Creates the custom `ar_li_type` property on line_items if it doesn't exist."""
+    url  = f"{BASE_URL}/crm/v3/properties/line_items"
+    body = {
+        "name":      "ar_li_type",
+        "label":     "AR Line Item Type",
+        "type":      "string",
+        "fieldType": "text",
+        "groupName": "lineiteminformation",
+    }
+    resp = requests.post(url, headers=HEADERS, json=body)
+    # 409 = already exists — that's fine
+    if resp.status_code not in (200, 201, 409):
+        raise_for_status(resp, "create ar_li_type property")
+    return True
+
+
+def seed_li_types_from_hubspot(line_items: list[dict], li_types: dict) -> bool:
+    """
+    Reads `ar_li_type` from fetched line item properties and writes any
+    missing entries into `li_types` (in-place).  Returns True if anything changed.
+    """
+    changed = False
+    for li in line_items:
+        li_id   = li["id"]
+        hs_type = (li.get("properties", {}).get("ar_li_type") or "").strip().lower()
+        if li_id not in li_types and hs_type in TYPE_KEY_MAP.values():
+            li_types[li_id] = hs_type
+            changed = True
+    return changed
+
+
+def save_li_types_to_hubspot(updated_types: dict):
+    """PATCHes each line item with its ar_li_type value (fire-and-forget errors)."""
+    for li_id, li_type in updated_types.items():
+        try:
+            r = requests.patch(
+                f"{BASE_URL}/crm/v3/objects/line_items/{li_id}",
+                headers=HEADERS,
+                json={"properties": {"ar_li_type": li_type}},
+            )
+            raise_for_status(r, f"save ar_li_type for {li_id}")
+        except Exception:
+            pass  # Non-critical; local state is the fallback
+
+
 # ── Tab 1: Configure Line Items ────────────────────────────────────────────────
 def render_configure_tab(deal_id: str, line_items: list[dict], state: dict):
     li_types = state["line_item_types"]
+
+    # Seed any missing types from the HubSpot ar_li_type property
+    try:
+        ensure_li_type_property()
+    except Exception:
+        pass
+    if seed_li_types_from_hubspot(line_items, li_types):
+        save_state(state)  # keep local cache in sync
 
     unconfigured = [li for li in line_items if li["id"] not in li_types]
     if unconfigured:
@@ -809,13 +874,19 @@ def render_configure_tab(deal_id: str, line_items: list[dict], state: dict):
 
     if st.button("Save Configuration", type="primary"):
         li_types.update(updated_types)
-        save_state(state)
+        save_state(state)                         # local cache
+        save_li_types_to_hubspot(updated_types)   # shared source of truth
+        fetch_line_items_for_deal.clear()         # bust cache so others see it
         st.success("Configuration saved.")
 
 # ── Tab 2: Create Invoice ──────────────────────────────────────────────────────
 def render_create_invoice_tab(deal_id: str, line_items: list[dict], state: dict):
     li_types   = state["line_item_types"]
     miles_hist = state["miles_history"]
+
+    # Seed li_types from HubSpot for any items not in local state
+    if seed_li_types_from_hubspot(line_items, li_types):
+        save_state(state)
 
     # Fetch deal stats
     try:

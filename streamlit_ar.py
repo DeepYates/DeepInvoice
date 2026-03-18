@@ -769,18 +769,20 @@ def render_dashboard(deals: list[dict]):
     # ── Top open balances ─────────────────────────────────────────────────────
     st.subheader("Top Open Balances")
     top_open = sorted(
-        [r for r in deal_rows if r["Open"] > 0],
-        key=lambda r: r["Open"], reverse=True
+        [r for r in deal_rows if r["Remaining"] > 0],
+        key=lambda r: r["Remaining"], reverse=True
     )[:10]
     if top_open:
         st.dataframe(
-            [{"Deal": r["Deal"], "Open": f"${r['Open']:,.0f}",
-              "Remaining": f"${r['Remaining']:,.0f}"}
+            [{"Deal":     r["Deal"],
+              "Invoiced (Unpaid)": f"${r['Open']:,.0f}",
+              "Unbilled":          f"${max(r['Remaining'] - r['Open'], 0):,.0f}",
+              "Total Remaining":   f"${r['Remaining']:,.0f}"}
              for r in top_open],
             use_container_width=True, hide_index=True,
         )
     else:
-        st.info("No open invoices.")
+        st.info("No outstanding balances.")
 
     # ── Recent invoice activity ───────────────────────────────────────────────
     st.subheader("Recent Invoice Activity")

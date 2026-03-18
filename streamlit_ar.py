@@ -176,7 +176,7 @@ def fetch_invoices_for_deal(deal_id: str) -> list[dict]:
     # Batch read invoices
     read_url = f"{BASE_URL}/crm/v3/objects/invoices/batch/read"
     props    = ["hs_invoice_status", "hs_amount_billed", "hs_createdate",
-                "hs_due_date", "hs_number"]
+                "hs_due_date", "hs_number", "hs_invoice_link"]
     all_inv  = []
     for i in range(0, len(inv_ids), 100):
         chunk = inv_ids[i:i+100]
@@ -391,20 +391,24 @@ def patch_deal_stage(deal_id: str, stage_id: str):
 
 # ── Invoice creation ───────────────────────────────────────────────────────────
 def create_invoice_in_hubspot(deal_id: str, line_items_to_bill: list[dict],
-                               due_date: date, publish: bool = False) -> tuple[str, str]:
+                               due_date: date, publish: bool = False,
+                               memo: str = "") -> tuple[str, str, str]:
     """
     Creates the invoice, its line items, and associations.
     If publish=True, sets hs_invoice_status='open' and returns the share link.
-    Returns: (invoice_id, invoice_link)  — link is '' when still draft.
+    Returns: (invoice_id, invoice_link, hs_number) — link is '' when still draft.
     """
     # 1. Create invoice (draft)
+    inv_props: dict = {
+        "hs_due_date": due_date.isoformat(),
+        "hs_currency": "USD",
+    }
+    if memo:
+        inv_props["hs_note"] = memo
     inv_resp = requests.post(
         f"{BASE_URL}/crm/v3/objects/invoices",
         headers=HEADERS,
-        json={"properties": {
-            "hs_due_date": due_date.isoformat(),
-            "hs_currency": "USD",
-        }},
+        json={"properties": inv_props},
     )
     raise_for_status(inv_resp, "create invoice")
     invoice_id = inv_resp.json()["id"]
@@ -453,6 +457,33 @@ def create_invoice_in_hubspot(deal_id: str, line_items_to_bill: list[dict],
     )
     raise_for_status(assoc_deal_resp, "associate invoice → deal")
 
+    # 4b. Silently associate deal's contacts → invoice (type 178)
+    try:
+        contact_assoc_resp = requests.post(
+            f"{BASE_URL}/crm/v4/associations/deals/contacts/batch/read",
+            headers=HEADERS,
+            json={"inputs": [{"id": deal_id}]},
+        )
+        if contact_assoc_resp.ok:
+            contact_ids = [
+                item["toObjectId"]
+                for result in contact_assoc_resp.json().get("results", [])
+                for item in result.get("to", [])
+            ]
+            if contact_ids:
+                requests.post(
+                    f"{BASE_URL}/crm/v4/associations/invoices/contacts/batch/create",
+                    headers=HEADERS,
+                    json={"inputs": [
+                        {"from": {"id": invoice_id}, "to": {"id": str(cid)},
+                         "types": [{"associationCategory": "HUBSPOT_DEFINED",
+                                    "associationTypeId": 178}]}
+                        for cid in contact_ids
+                    ]},
+                )
+    except Exception:
+        pass  # Non-critical; don't fail invoice creation
+
     # 5. Optionally publish (open) the invoice and retrieve its share link
     invoice_link = ""
     if publish:
@@ -463,15 +494,18 @@ def create_invoice_in_hubspot(deal_id: str, line_items_to_bill: list[dict],
         )
         raise_for_status(patch_resp, "publish invoice")
 
-        link_resp = requests.get(
-            f"{BASE_URL}/crm/v3/objects/invoices/{invoice_id}",
-            headers=HEADERS,
-            params={"properties": "hs_invoice_link,hs_number"},
-        )
-        raise_for_status(link_resp, "fetch invoice link")
-        invoice_link = link_resp.json().get("properties", {}).get("hs_invoice_link", "")
+    # 6. Fetch hs_number (and link if published)
+    meta_resp = requests.get(
+        f"{BASE_URL}/crm/v3/objects/invoices/{invoice_id}",
+        headers=HEADERS,
+        params={"properties": "hs_invoice_link,hs_number"},
+    )
+    raise_for_status(meta_resp, "fetch invoice meta")
+    meta_props   = meta_resp.json().get("properties", {})
+    invoice_link = meta_props.get("hs_invoice_link", "") if publish else ""
+    hs_number    = meta_props.get("hs_number", "")
 
-    return invoice_id, invoice_link
+    return invoice_id, invoice_link, hs_number
 
 # ── Deal details inline panel ──────────────────────────────────────────────────
 def render_deal_details_panel(deal_data: dict, state: dict):
@@ -530,6 +564,7 @@ def render_deal_details_panel(deal_data: dict, state: dict):
             li_rows.append({
                 "Name":       name,
                 "Type":       TYPE_DISPLAY.get(li_type_key, "Standard"),
+                "Qty":        f"{qty:g}",
                 "Unit Price": f"${unit_p:,.4f}",
                 "Contract":   f"${contract_total:,.2f}",
                 "Billed":     f"${billed_amt:,.2f}",
@@ -561,16 +596,51 @@ def render_deal_details_panel(deal_data: dict, state: dict):
             })
         st.dataframe(draft_rows, use_container_width=True, hide_index=True)
 
+    # Change Deal Stage
+    st.divider()
+    stage_key = f"show_stage_{p['id']}"
+    if st.button("Change Deal Stage", key=f"stage_toggle_{p['id']}"):
+        st.session_state[stage_key] = not st.session_state.get(stage_key, False)
+
+    if st.session_state.get(stage_key, False):
+        try:
+            stages = fetch_deal_stages()
+        except Exception as e:
+            st.error(f"Could not fetch stages: {e}")
+            stages = []
+
+        if stages:
+            stage_labels = [f"{s['label']}  ({s['pipelineLabel']})" for s in stages]
+            chosen_label = st.selectbox("Target stage", stage_labels,
+                                        key=f"stage_select_{p['id']}")
+            chosen_stage = stages[stage_labels.index(chosen_label)]
+
+            c1, c2 = st.columns([1, 3])
+            if c1.button("Apply", key=f"stage_apply_{p['id']}", type="primary"):
+                try:
+                    patch_deal_stage(p["id"], chosen_stage["stageId"])
+                    fetch_closed_won_deals.clear()
+                    st.session_state[stage_key] = False
+                    st.success(f"Deal moved to **{chosen_stage['label']}**.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+            if c2.button("Cancel", key=f"stage_cancel_{p['id']}"):
+                st.session_state[stage_key] = False
+                st.rerun()
+
 
 # ── Page: No deal selected (summary table) ────────────────────────────────────
-# Column proportions: Name | Amount | Billed | Open | Paid | Remaining | #Inv | #Draft | Details | Invoice
-_COL_W = [2.8, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 0.55, 0.75, 0.85]
+# Column proportions: Name | Amount | Billed | Open | Paid | Remaining | #Inv | #Draft | Close Date | Details | Invoice
+_COL_W = [2.8, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 0.55, 1.0, 0.75, 0.85]
 
 def render_summary(deals: list[dict], state: dict):
     st.subheader("Closed-Won Deals Summary")
     if not deals:
         st.info("No closed-won deals found.")
         return
+
+    search = st.text_input("🔍 Search deals...", "")
 
     # Build all deal data (invoice totals computed live from HubSpot invoices)
     all_deal_data = []
@@ -608,15 +678,21 @@ def render_summary(deals: list[dict], state: dict):
                 "description": p.get("description", ""),
             })
 
+    # Apply search filter
+    search_lower = search.strip().lower()
+    visible_deals = [dd for dd in all_deal_data
+                     if not search_lower or search_lower in dd["name"].lower()]
+
     # Header row
     hcols = st.columns(_COL_W)
     for col, label in zip(hcols, ["Deal Name", "Amount", "Billed", "Open",
-                                   "Paid", "Remaining", "#Inv", "#Draft", "", ""]):
+                                   "Paid", "Remaining", "#Inv", "#Draft",
+                                   "Close Date", "", ""]):
         col.markdown(f"**{label}**")
     st.divider()
 
     # Data rows
-    for dd in all_deal_data:
+    for dd in visible_deals:
         cols = st.columns(_COL_W)
         cols[0].write(dd["name"])
         cols[1].write(f"${dd['amount']:,.2f}")
@@ -628,12 +704,13 @@ def render_summary(deals: list[dict], state: dict):
         cols[6].write(str(dd["count"]))
         draft_str = str(dd["drafts"]) if dd["drafts"] else "—"
         cols[7].write(f"**{draft_str}**" if dd["drafts"] else draft_str)
+        cols[8].write(dd["closedate"][:10] if dd["closedate"] else "—")
 
         det_key = f"show_det_{dd['id']}"
-        if cols[8].button("Details", key=f"det_btn_{dd['id']}"):
+        if cols[9].button("Details", key=f"det_btn_{dd['id']}"):
             st.session_state[det_key] = not st.session_state.get(det_key, False)
 
-        if cols[9].button("Invoice →", key=f"inv_btn_{dd['id']}"):
+        if cols[10].button("Invoice →", key=f"inv_btn_{dd['id']}"):
             st.session_state["selected_deal_id"]     = dd["id"]
             st.session_state["selected_deal_amount"] = dd["amount"]
             st.session_state["view"]                 = "deal"
@@ -901,6 +978,12 @@ def render_create_invoice_tab(deal_id: str, line_items: list[dict], state: dict)
         c1.metric("Invoice Total", f"${pending['total']:,.2f}")
         c2.metric("Due Date", str(pending["due_date"]))
 
+        memo = st.text_area("Memo / notes", value=pending.get("memo", ""),
+                            placeholder="Optional notes to include on the invoice")
+        if memo != pending.get("memo", ""):
+            pending["memo"] = memo
+            st.session_state[confirm_key] = pending
+
         st.divider()
         publish = st.toggle(
             "Publish & send invoice email",
@@ -924,8 +1007,9 @@ def render_create_invoice_tab(deal_id: str, line_items: list[dict], state: dict)
                 for l in pending["lines"]
             ]
             try:
-                inv_id, inv_link = create_invoice_in_hubspot(
-                    deal_id, hs_lines, pending["due_date"], publish=publish
+                inv_id, inv_link, hs_number = create_invoice_in_hubspot(
+                    deal_id, hs_lines, pending["due_date"], publish=publish,
+                    memo=pending.get("memo", "")
                 )
 
                 # Record miles history
@@ -946,12 +1030,14 @@ def render_create_invoice_tab(deal_id: str, line_items: list[dict], state: dict)
                 fetch_closed_won_deals.clear()
                 st.session_state.pop(confirm_key, None)
 
+                num_label = f" **{hs_number}**" if hs_number else f" `{inv_id}`"
                 if publish and inv_link:
-                    st.success(f"Invoice published! ID: `{inv_id}`")
-                    st.markdown(f"**Share link:** [{inv_link}]({inv_link})")
+                    st.success(f"Invoice{num_label} published!")
+                    st.code(inv_link)
+                    st.link_button("Open Invoice", inv_link)
                 else:
                     status_note = "published as Open" if publish else "saved as Draft"
-                    st.success(f"Invoice created ({status_note})! ID: `{inv_id}`")
+                    st.success(f"Invoice{num_label} created ({status_note})!")
 
             except requests.HTTPError as e:
                 st.error(f"HubSpot API error: {e}")
@@ -966,6 +1052,14 @@ def render_history_tab(deal_id: str, state: dict):
         st.error(f"Could not fetch invoices: {e}")
         return
 
+    _STATUS_BADGE = {
+        "OVERDUE": "🔴 OVERDUE",
+        "PAID":    "✅ PAID",
+        "OPEN":    "📬 OPEN",
+        "DRAFT":   "📄 DRAFT",
+    }
+    today_str = date.today().isoformat()
+
     st.subheader("HubSpot Invoices")
     if not invoices:
         st.info("No invoices found for this deal.")
@@ -976,15 +1070,27 @@ def render_history_tab(deal_id: str, state: dict):
             status = (p.get("hs_invoice_status") or "").upper()
             if status in EXCLUDE_STATUSES:
                 continue
+            due_date_str = (p.get("hs_due_date") or "")[:10]
+            # Flag overdue by date even if status not yet updated
+            if status == "OPEN" and due_date_str and due_date_str < today_str:
+                display_status = "🔴 OVERDUE"
+            else:
+                display_status = _STATUS_BADGE.get(status, status)
+            inv_link = p.get("hs_invoice_link", "")
             rows.append({
                 "Invoice ID": inv["id"],
                 "Number":     p.get("hs_number", ""),
-                "Status":     p.get("hs_invoice_status", ""),
+                "Status":     display_status,
                 "Amount":     f"${float(p.get('hs_amount_billed') or 0):,.2f}",
                 "Created":    (p.get("hs_createdate") or "")[:10],
-                "Due":        (p.get("hs_due_date") or "")[:10],
+                "Due":        due_date_str,
+                "Link":       inv_link,
             })
-        st.dataframe(rows, use_container_width=True)
+        st.dataframe(
+            rows,
+            use_container_width=True,
+            column_config={"Link": st.column_config.LinkColumn("Link")},
+        )
 
     # Miles history breakdown
     deal_history = state["miles_history"].get(deal_id, {})
@@ -1007,9 +1113,19 @@ def _render_draft_invoice_row(draft: dict):
     edit_key = f"draft_edit_{inv_id}"
     del_key  = f"draft_del_{inv_id}"
 
+    # Show persistent link if invoice was just published
+    pub_link_key = f"published_link_{inv_id}"
+    if st.session_state.get(pub_link_key):
+        st.code(st.session_state[pub_link_key])
+
+    today_iso = date.today().isoformat()
+    due_display = draft["due_date"] or "—"
+    if draft["due_date"] and draft["due_date"] < today_iso:
+        due_display += " ⚠️"
+
     cols = st.columns([1.0, 1.4, 1.0, 1.1, 0.7, 0.85, 0.65])
     cols[0].write(draft["number"] or inv_id[:10])
-    cols[1].write(draft["due_date"] or "—")
+    cols[1].write(due_display)
     cols[2].write(f"${draft['amount']:,.2f}")
     cols[3].write(draft["created"][:10] if draft["created"] else "—")
 
@@ -1035,9 +1151,7 @@ def _render_draft_invoice_row(draft: dict):
             fetch_invoices_for_deal.clear()
             fetch_invoiced_amounts_for_deal.clear()
             if link:
-                st.success(f"Published! [View invoice]({link})")
-            else:
-                st.success("Invoice published.")
+                st.session_state[f"published_link_{inv_id}"] = link
             st.rerun()
         except Exception as e:
             st.error(str(e))
@@ -1136,6 +1250,29 @@ def render_drafts_view(deal_lookup: dict):
         return
 
     st.caption(f"{len(drafts)} draft invoice(s) across all deals")
+
+    if st.button("Publish All Drafts", type="primary"):
+        published = 0
+        errors    = []
+        for draft in drafts:
+            try:
+                r = requests.patch(
+                    f"{BASE_URL}/crm/v3/objects/invoices/{draft['id']}",
+                    headers=HEADERS,
+                    json={"properties": {"hs_invoice_status": "open"}},
+                )
+                raise_for_status(r, f"publish {draft['id']}")
+                published += 1
+            except Exception as e:
+                errors.append(str(e))
+        fetch_all_draft_invoices.clear()
+        fetch_invoices_for_deal.clear()
+        fetch_invoiced_amounts_for_deal.clear()
+        if errors:
+            st.error(f"Published {published}, {len(errors)} failed:\n" + "\n".join(errors))
+        else:
+            st.success(f"Published {published} invoice(s).")
+        st.rerun()
 
     # Group by deal
     by_deal: dict[str, list] = {}

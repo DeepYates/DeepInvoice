@@ -1183,8 +1183,6 @@ def render_history_tab(deal_id: str, state: dict):
     }
     today_str = date.today().isoformat()
 
-    portal_id = st.session_state.get("hub_id") or fetch_portal_id()
-
     st.subheader("HubSpot Invoices")
     if not invoices:
         st.info("No invoices found for this deal.")
@@ -1200,9 +1198,6 @@ def render_history_tab(deal_id: str, state: dict):
             else:
                 display_status = _STATUS_BADGE.get(status, status) or status
             inv_link = p.get("hs_invoice_link", "")
-            # Fallback to CRM URL for invoices without a shareable link (drafts, voided, paid)
-            if not inv_link and portal_id:
-                inv_link = f"https://app.hubspot.com/invoices/{portal_id}/view/{inv['id']}"
             rows.append({
                 "Invoice ID": inv["id"],
                 "Number":     p.get("hs_number", ""),

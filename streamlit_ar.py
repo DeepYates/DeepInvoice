@@ -648,6 +648,174 @@ def render_deal_details_panel(deal_data: dict, state: dict):
                 st.rerun()
 
 
+# ── Page: AR Dashboard ─────────────────────────────────────────────────────────
+def render_dashboard(deals: list[dict]):
+    st.header("AR Dashboard")
+    today = date.today()
+
+    # Aggregate across all deals
+    total_contract = total_billed = total_open = total_paid = 0.0
+    total_inv = total_overdue_count = total_draft_count = 0
+    aging = {"Current": 0.0, "1–30 days": 0.0, "31–60 days": 0.0,
+             "61–90 days": 0.0, "90+ days": 0.0}
+    deal_rows   = []
+    recent_invs = []  # (created_str, deal_name, status, amount)
+
+    with st.spinner("Computing dashboard…"):
+        for d in deals:
+            p       = d.get("properties", {})
+            deal_id = d["id"]
+            name    = p.get("dealname") or "(unnamed)"
+            amount  = float(p.get("amount") or 0)
+            total_contract += amount
+            try:
+                invoices = fetch_invoices_for_deal(deal_id)
+                open_t, paid, billed, count = aggregate_invoices(invoices)
+                drafts = count_draft_invoices(invoices)
+            except Exception:
+                open_t = paid = billed = 0.0
+                count = drafts = 0
+                invoices = []
+
+            total_billed += billed
+            total_open   += open_t
+            total_paid   += paid
+            total_inv    += count
+            total_draft_count += drafts
+
+            for inv in invoices:
+                ip     = inv.get("properties", {})
+                status = (ip.get("hs_invoice_status") or "").upper()
+                amt    = float(ip.get("hs_amount_billed") or 0)
+                due_s  = (ip.get("hs_due_date") or "")[:10]
+                created_s = (ip.get("hs_createdate") or "")[:10]
+
+                # Aging: open invoices only
+                if status in OPEN_STATUSES:
+                    total_overdue_count += (1 if status == "OVERDUE" else 0)
+                    if not due_s:
+                        aging["Current"] += amt
+                    else:
+                        try:
+                            due_d    = date.fromisoformat(due_s)
+                            days_ago = (today - due_d).days
+                        except ValueError:
+                            days_ago = 0
+                        if days_ago <= 0:
+                            aging["Current"] += amt
+                        elif days_ago <= 30:
+                            aging["1–30 days"] += amt
+                        elif days_ago <= 60:
+                            aging["31–60 days"] += amt
+                        elif days_ago <= 90:
+                            aging["61–90 days"] += amt
+                        else:
+                            aging["90+ days"] += amt
+
+                # Recent invoices (non-draft)
+                if status not in ("DRAFT", "") and created_s:
+                    recent_invs.append((created_s, name, status, amt,
+                                        ip.get("hs_number", "")))
+
+            deal_rows.append({
+                "Deal":      name,
+                "Contract":  amount,
+                "Billed":    billed,
+                "Open":      open_t,
+                "Paid":      paid,
+                "Remaining": amount - paid,
+                "#Inv":      count,
+                "#Draft":    drafts,
+            })
+
+    total_remaining      = total_contract - total_paid
+    collection_rate      = (total_paid / total_billed * 100) if total_billed else 0.0
+    pct_billed           = (total_billed / total_contract * 100) if total_contract else 0.0
+
+    # ── KPI row ───────────────────────────────────────────────────────────────
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Total Contract",  f"${total_contract:,.0f}")
+    k2.metric("Total Billed",    f"${total_billed:,.0f}",
+              delta=f"{pct_billed:.0f}% of contract")
+    k3.metric("Outstanding",     f"${total_open:,.0f}")
+    k4.metric("Total Paid",      f"${total_paid:,.0f}")
+    k5.metric("Remaining",       f"${total_remaining:,.0f}")
+    k6.metric("Collection Rate", f"{collection_rate:.0f}%")
+
+    st.divider()
+
+    # ── Invoice count badges ──────────────────────────────────────────────────
+    ic1, ic2, ic3, ic4 = st.columns(4)
+    ic1.metric("Active Invoices", total_inv)
+    ic2.metric("Overdue",         total_overdue_count,
+               delta="⚠️ needs attention" if total_overdue_count else None,
+               delta_color="inverse" if total_overdue_count else "off")
+    ic3.metric("Drafts Pending",  total_draft_count)
+    ic4.metric("Deals Tracked",   len(deals))
+
+    st.divider()
+
+    # ── AR Aging ─────────────────────────────────────────────────────────────
+    st.subheader("AR Aging (Open Invoices)")
+    ag_cols = st.columns(len(aging))
+    for col, (bucket, val) in zip(ag_cols, aging.items()):
+        col.metric(bucket, f"${val:,.0f}")
+
+    if aging["90+ days"] > 0 or aging["61–90 days"] > 0:
+        st.warning("You have invoices 60+ days overdue. Consider following up.")
+
+    st.divider()
+
+    # ── Top open balances ─────────────────────────────────────────────────────
+    st.subheader("Top Open Balances")
+    top_open = sorted(
+        [r for r in deal_rows if r["Open"] > 0],
+        key=lambda r: r["Open"], reverse=True
+    )[:10]
+    if top_open:
+        st.dataframe(
+            [{"Deal": r["Deal"], "Open": f"${r['Open']:,.0f}",
+              "Remaining": f"${r['Remaining']:,.0f}"}
+             for r in top_open],
+            use_container_width=True, hide_index=True,
+        )
+    else:
+        st.info("No open invoices.")
+
+    # ── Recent invoice activity ───────────────────────────────────────────────
+    st.subheader("Recent Invoice Activity")
+    recent_sorted = sorted(recent_invs, key=lambda x: x[0], reverse=True)[:15]
+    if recent_sorted:
+        _STATUS_BADGE = {"OVERDUE": "🔴 OVERDUE", "PAID": "✅ PAID",
+                         "OPEN": "📬 OPEN", "VOID": "🚫 VOID"}
+        st.dataframe(
+            [{"Date":   r[0], "Deal": r[1],
+              "Number": r[4], "Status": _STATUS_BADGE.get(r[2], r[2]),
+              "Amount": f"${r[3]:,.0f}"}
+             for r in recent_sorted],
+            use_container_width=True, hide_index=True,
+        )
+    else:
+        st.info("No recent invoice activity.")
+
+    st.divider()
+
+    # ── Full deal breakdown ───────────────────────────────────────────────────
+    st.subheader("All Deals")
+    st.dataframe(
+        [{"Deal":      r["Deal"],
+          "Contract":  f"${r['Contract']:,.0f}",
+          "Billed":    f"${r['Billed']:,.0f}",
+          "Open":      f"${r['Open']:,.0f}",
+          "Paid":      f"${r['Paid']:,.0f}",
+          "Remaining": f"${r['Remaining']:,.0f}",
+          "#Inv":      r["#Inv"],
+          "#Draft":    r["#Draft"]}
+         for r in sorted(deal_rows, key=lambda r: r["Open"], reverse=True)],
+        use_container_width=True, hide_index=True,
+    )
+
+
 # ── Page: No deal selected (summary table) ────────────────────────────────────
 # Column proportions: Name | Amount | Billed | Open | Paid | Remaining | #Inv | #Draft | Close Date | Details | Invoice
 _COL_W = [2.8, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 0.55, 1.0, 0.75, 0.85]
@@ -1504,6 +1672,11 @@ def main():
                 st.rerun()
 
         # Nav buttons — highlight the active view
+        if st.button("📊 Dashboard", type="primary" if current_view == "dashboard" else "secondary"):
+            st.session_state["view"] = "dashboard"
+            st.session_state.pop("selected_deal_id", None)
+            st.rerun()
+
         if st.button("📋 Deals", type="primary" if current_view in ("summary","deal") else "secondary"):
             st.session_state["view"] = "summary"
             st.session_state.pop("selected_deal_id", None)
@@ -1537,6 +1710,10 @@ def main():
     if selected_id and view != "deal":
         st.session_state["view"] = "deal"
         view = "deal"
+
+    if view == "dashboard":
+        render_dashboard(deals)
+        return
 
     if view == "drafts":
         st.header("Draft Invoices")

@@ -1,0 +1,21 @@
+# Secrets
+.env
+
+# Local state (regenerated at runtime)
+ar_state.json
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+
+# Claude Code
+.claude/

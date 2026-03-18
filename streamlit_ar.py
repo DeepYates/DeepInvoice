@@ -987,24 +987,48 @@ def render_create_invoice_tab(deal_id: str, line_items: list[dict], state: dict)
 
         else:  # standard
             contract_total = float(props.get("amount") or unit_p * qty)
+            billed_qty     = inv_data.get("quantity", 0.0)
             prev_amt       = inv_data.get("amount", 0.0)
-            remaining_amt  = contract_total - prev_amt
-            st.markdown(f"**{name}** — Standard  *(auto-included)*")
+            remaining_qty  = max(qty - billed_qty, 0.0)
+            remaining_amt  = max(contract_total - prev_amt, 0.0)
+
+            st.markdown(f"**{name}** — Standard  (${unit_p:,.4f}/unit)")
             st.caption(
-                f"Contract: ${contract_total:,.2f}  ·  "
-                f"Previously billed: ${prev_amt:,.2f}  ·  "
-                f"Remaining: ${remaining_amt:,.2f}"
+                f"Contract: {qty:g} unit(s) · ${contract_total:,.2f}  ·  "
+                f"Billed: {billed_qty:g} · ${prev_amt:,.2f}  ·  "
+                f"Remaining: {remaining_qty:g} · ${remaining_amt:,.2f}"
             )
-            invoice_lines.append({
-                "li_id":       li_id,
-                "li_type":     "standard",
-                "name":        name,
-                "unit_price":  unit_p,
-                "quantity":    qty,
-                "amount":      contract_total,
-                "description": props.get("description", ""),
-                "miles":       0,
-            })
+
+            bill_all = st.checkbox(
+                "Bill all remaining",
+                value=(remaining_qty > 0),
+                key=f"std_all_{li_id}",
+            )
+            if bill_all:
+                bill_qty = remaining_qty
+            else:
+                bill_qty = st.number_input(
+                    "Units to bill",
+                    min_value=0.0,
+                    max_value=float(max(remaining_qty, 0)),
+                    value=0.0,
+                    step=1.0,
+                    key=f"std_qty_{li_id}",
+                )
+            bill_amt = round(unit_p * bill_qty, 2)
+            st.write(f"→ {bill_qty:g} unit(s)  ·  **${bill_amt:,.2f}**")
+
+            if bill_qty > 0:
+                invoice_lines.append({
+                    "li_id":       li_id,
+                    "li_type":     "standard",
+                    "name":        name,
+                    "unit_price":  unit_p,
+                    "quantity":    bill_qty,
+                    "amount":      bill_amt,
+                    "description": props.get("description", ""),
+                    "miles":       0,
+                })
 
     st.divider()
     invoice_total = sum(l["amount"] for l in invoice_lines)

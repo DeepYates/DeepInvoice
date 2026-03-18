@@ -1161,6 +1161,7 @@ def render_history_tab(deal_id: str, state: dict):
         "PAID":    "✅ PAID",
         "OPEN":    "📬 OPEN",
         "DRAFT":   "📄 DRAFT",
+        "VOID":    "🚫 VOID",
     }
     today_str = date.today().isoformat()
 
@@ -1174,16 +1175,14 @@ def render_history_tab(deal_id: str, state: dict):
         for inv in invoices:
             p      = inv.get("properties", {})
             status = (p.get("hs_invoice_status") or "").upper()
-            if status in EXCLUDE_STATUSES:
-                continue
             due_date_str = (p.get("hs_due_date") or "")[:10]
             # Flag overdue by date even if status not yet updated
             if status == "OPEN" and due_date_str and due_date_str < today_str:
                 display_status = "🔴 OVERDUE"
             else:
-                display_status = _STATUS_BADGE.get(status, status)
+                display_status = _STATUS_BADGE.get(status, status) or status
             inv_link = p.get("hs_invoice_link", "")
-            # Fallback to CRM URL when hs_invoice_link is empty (e.g. paid invoices)
+            # Fallback to CRM URL for invoices without a shareable link (drafts, voided, paid)
             if not inv_link and portal_id:
                 inv_link = f"https://app.hubspot.com/invoices/{portal_id}/view/{inv['id']}"
             rows.append({

@@ -5,11 +5,14 @@ HubSpot Commerce Hub invoices via the API.
 
 Run: streamlit run streamlit_ar.py
 """
-import os, json, secrets, hashlib, urllib.parse, requests
+import os
+import json
+import hashlib
+import urllib.parse
+import requests
 from pathlib import Path
 from datetime import date, timedelta
 
-import sys
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -19,29 +22,12 @@ STATE_FILE   = SCRIPT_DIR / "ar_state.json"
 
 load_dotenv(SCRIPT_DIR / ".env", override=True)
 
-# ── DeepGeo integration ────────────────────────────────────────────────────────
-sys.path.insert(0, str(SCRIPT_DIR / "DeepGeo"))
-try:
-    from DeepGeo.config import EnvConfig as DeepGeoEnvConfig
-    from DeepGeo.project import Project as DeepGeoProject
-    from DeepGeo.map_utils import get_length_from_line_gdf
-    DEEPGEO_AVAILABLE = True
-except ImportError:
-    DEEPGEO_AVAILABLE = False
-
-DEEPGEO_USERNAME = os.environ.get("DEEPGEO_USERNAME", "")
-DEEPGEO_PASSWORD = os.environ.get("DEEPGEO_PASSWORD", "")
-AWS_KEY_ID       = os.environ.get("AWS_KEY_ID", "")
-AWS_SECRET_KEY   = os.environ.get("AWS_SECRET_KEY", "")
-
-# Stages as defined by DeepWalk workflow
-COLLECTED_STAGES  = {
-    "passed", "rescan_check", "rescan_review", "auto_measurements",
-    "measurements_fix", "measurements_fix_ramp", "measurement_fix_review",
-    "obstruction_label", "panel_label", "ramp_label", "label_review",
-}
-COMPLETED_STAGES  = {"passed"}
-PROCESSING_STAGES = COLLECTED_STAGES - COMPLETED_STAGES
+# ── DeepWalk Auth0 config ─────────────────────────────────────────────────────
+DW_AUTH0_CLIENT_ID     = os.environ.get("DEEPWALK_AUTH0_CLIENT_ID", "")
+DW_AUTH0_CLIENT_SECRET = os.environ.get("DEEPWALK_AUTH0_CLIENT_SECRET", "")
+DW_AUTH0_DOMAIN        = os.environ.get("DEEPWALK_AUTH0_DOMAIN", "")
+DW_AUTH0_AUDIENCE      = os.environ.get("DEEPWALK_AUTH0_AUDIENCE", "")
+DW_AUTH0_REDIRECT_URI  = os.environ.get("DEEPWALK_AUTH0_REDIRECT_URI", "http://localhost:8501")
 
 HUBSPOT_TOKEN  = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
 BASE_URL       = "https://api.hubapi.com"
@@ -123,11 +109,63 @@ def render_login_page():
     st.link_button("Sign in with HubSpot", oauth_auth_url(), type="primary")
     st.caption("You'll be redirected to HubSpot to authorize access.")
 
+# ── DeepWalk OAuth helpers ────────────────────────────────────────────────────
+def _dw_oauth_state() -> str:
+    """Deterministic state token for DeepWalk OAuth — prefixed to distinguish from HubSpot."""
+    return "dw-" + hashlib.sha256(f"dw-oauth-{DW_AUTH0_CLIENT_SECRET}".encode()).hexdigest()[:28]
+
+def dw_auth_url() -> str:
+    return f"https://{DW_AUTH0_DOMAIN}/authorize?" + urllib.parse.urlencode({
+        "client_id":     DW_AUTH0_CLIENT_ID,
+        "redirect_uri":  DW_AUTH0_REDIRECT_URI,
+        "response_type": "code",
+        "scope":         "openid profile email",
+        "audience":      DW_AUTH0_AUDIENCE,
+        "state":         _dw_oauth_state(),
+        "prompt":        "none",
+    })
+
+def dw_auth_url_interactive() -> str:
+    """Same as dw_auth_url but without prompt=none — used for first login."""
+    return f"https://{DW_AUTH0_DOMAIN}/authorize?" + urllib.parse.urlencode({
+        "client_id":     DW_AUTH0_CLIENT_ID,
+        "redirect_uri":  DW_AUTH0_REDIRECT_URI,
+        "response_type": "code",
+        "scope":         "openid profile email",
+        "audience":      DW_AUTH0_AUDIENCE,
+        "state":         _dw_oauth_state(),
+    })
+
+def dw_exchange_code(code: str) -> dict:
+    """Exchange a DeepWalk Auth0 authorization code for tokens."""
+    r = requests.post(
+        f"https://{DW_AUTH0_DOMAIN}/oauth/token",
+        json={
+            "grant_type":    "authorization_code",
+            "client_id":     DW_AUTH0_CLIENT_ID,
+            "client_secret": DW_AUTH0_CLIENT_SECRET,
+            "redirect_uri":  DW_AUTH0_REDIRECT_URI,
+            "code":          code,
+        },
+    )
+    r.raise_for_status()
+    return r.json()
+
+def render_dw_login_page():
+    st.set_page_config(page_title="Sign In — AR", page_icon="💰", layout="centered")
+    st.title("💰 Accounts Receivable")
+    st.markdown("Sign in with your DeepWalk account to continue.")
+    st.divider()
+    st.link_button("Sign in with DeepWalk", dw_auth_url_interactive(), type="primary")
+    st.caption("You'll be redirected to DeepWalk to authorize access.")
+
 # ── HubSpot helpers ────────────────────────────────────────────────────────────
 def raise_for_status(resp, context=""):
     if not resp.ok:
-        try:   body = resp.json()
-        except Exception: body = resp.text
+        try:
+            body = resp.json()
+        except Exception:
+            body = resp.text
         raise requests.HTTPError(
             f"HTTP {resp.status_code} [{context}]: {body}", response=resp
         )
@@ -1376,7 +1414,7 @@ def render_create_invoice_tab(deal_id: str, line_items: list[dict], state: dict)
                 })
 
     st.divider()
-    invoice_total = sum(l["amount"] for l in invoice_lines)
+    invoice_total = sum(ln["amount"] for ln in invoice_lines)
     st.metric("Invoice Total", f"${invoice_total:,.0f}")
 
     due_date = st.date_input("Due Date", value=date.today() + timedelta(days=30))
@@ -1402,15 +1440,15 @@ def render_create_invoice_tab(deal_id: str, line_items: list[dict], state: dict)
 
         # Line items summary table
         confirm_rows = []
-        for l in pending["lines"]:
-            qty_label = (f"{l['quantity']:g} mi" if l["li_type"] == "mileage"
-                         else f"{l['quantity']:g}")
+        for ln in pending["lines"]:
+            qty_label = (f"{ln['quantity']:g} mi" if ln["li_type"] == "mileage"
+                         else f"{ln['quantity']:g}")
             confirm_rows.append({
-                "Line Item":   l["name"],
-                "Type":        TYPE_DISPLAY.get(l["li_type"], l["li_type"].title()),
-                "Unit Price":  f"${l['unit_price']:,.4f}",
+                "Line Item":   ln["name"],
+                "Type":        TYPE_DISPLAY.get(ln["li_type"], ln["li_type"].title()),
+                "Unit Price":  f"${ln['unit_price']:,.4f}",
                 "Qty":         qty_label,
-                "Amount":      f"${l['amount']:,.0f}",
+                "Amount":      f"${ln['amount']:,.0f}",
             })
         st.dataframe(confirm_rows, use_container_width=True, hide_index=True)
 
@@ -1442,9 +1480,9 @@ def render_create_invoice_tab(deal_id: str, line_items: list[dict], state: dict)
 
         if col_confirm.button("Confirm & Create Invoice", type="primary"):
             hs_lines = [
-                {"name": l["name"], "unit_price": l["unit_price"],
-                 "quantity": l["quantity"], "description": l["description"]}
-                for l in pending["lines"]
+                {"name": ln["name"], "unit_price": ln["unit_price"],
+                 "quantity": ln["quantity"], "description": ln["description"]}
+                for ln in pending["lines"]
             ]
             try:
                 inv_id, inv_link, hs_number = create_invoice_in_hubspot(
@@ -1454,14 +1492,14 @@ def render_create_invoice_tab(deal_id: str, line_items: list[dict], state: dict)
 
                 # Record miles history
                 today_str = date.today().isoformat()
-                for l in pending["lines"]:
-                    if l["li_type"] == "mileage" and l["miles"] > 0:
+                for ln in pending["lines"]:
+                    if ln["li_type"] == "mileage" and ln["miles"] > 0:
                         deal_hist = miles_hist.setdefault(deal_id, {})
-                        deal_hist.setdefault(l["li_id"], []).append({
+                        deal_hist.setdefault(ln["li_id"], []).append({
                             "invoice_id": inv_id,
-                            "miles":      l["miles"],
+                            "miles":      ln["miles"],
                             "date":       today_str,
-                            "amount":     l["amount"],
+                            "amount":     ln["amount"],
                         })
                 save_state(state)
 
@@ -1605,11 +1643,11 @@ def _render_draft_invoice_row(draft: dict):
             li = fetch_invoice_line_items(inv_id)
             if li:
                 li_rows = [{
-                    "Name":   l["properties"].get("name", ""),
-                    "Qty":    l["properties"].get("quantity", ""),
-                    "Price":  f"${float(l['properties'].get('price') or 0):,.4f}",
-                    "Amount": f"${float(l['properties'].get('amount') or 0):,.0f}",
-                } for l in li]
+                    "Name":   ln["properties"].get("name", ""),
+                    "Qty":    ln["properties"].get("quantity", ""),
+                    "Price":  f"${float(ln['properties'].get('price') or 0):,.4f}",
+                    "Amount": f"${float(ln['properties'].get('amount') or 0):,.0f}",
+                } for ln in li]
                 st.dataframe(li_rows, use_container_width=True, hide_index=True)
             else:
                 st.caption("No line items.")
@@ -1735,42 +1773,34 @@ def render_drafts_view(deal_lookup: dict):
                 _render_draft_invoice_row(draft)
 
 
-# ── DeepGeo: scan mileage fetch ────────────────────────────────────────────────
-@st.cache_data(ttl=300)
+# ── DeepWalk API: mileage fetch ────────────────────────────────────────────────
+_EXCLUDED_STAGES = {"archive", "rescan"}
+
+
 def fetch_scan_miles_by_stage(project_id: int) -> dict:
-    """Returns {stage: miles} for all scans in the project via DeepGeo."""
-    env = DeepGeoEnvConfig(
-        username=DEEPGEO_USERNAME,
-        password=DEEPGEO_PASSWORD,
-        AWS_KEY_ID=AWS_KEY_ID,
-        AWS_SECRET_KEY=AWS_SECRET_KEY,
+    """Returns {stage: miles} for all scans in the project via DeepWalk API."""
+    token = st.session_state.get("dw_token", "")
+    resp  = requests.get(
+        f"https://app.deepwalkresearch.com/api/project/{project_id}/mileage/detailed",
+        headers={"Authorization": f"Bearer {token}"},
     )
-    project  = DeepGeoProject(project_id=project_id, env_config=env)
-    line_gdf, _ = project.scan_geodataframe()
-    if line_gdf is None or line_gdf.empty or "stage" not in line_gdf.columns:
-        return {}
-    result = {}
-    for stage, group in line_gdf.groupby("stage"):
-        try:
-            _, miles = get_length_from_line_gdf(group)
-            result[str(stage)] = round(float(miles), 2)
-        except Exception:
-            pass
-    return result
+    if resp.status_code == 401:
+        # Token expired — clear session and trigger silent re-auth
+        st.session_state.pop("dw_token", None)
+        st.session_state.pop("dw_authenticated", None)
+        st.rerun()
+    resp.raise_for_status()
+    return {str(k): float(v) for k, v in resp.json().items()}
 
 
 # ── Page: Scan Progress ────────────────────────────────────────────────────────
 def render_scan_progress(deals: list[dict]):
     st.header("Scan Progress")
 
-    if not DEEPGEO_AVAILABLE:
-        st.error("DeepGeo library could not be imported. Check that the DeepGeo submodule is initialised.")
-        return
-
-    if not DEEPGEO_USERNAME or not AWS_KEY_ID:
+    if not DW_AUTH0_CLIENT_ID or not DW_AUTH0_CLIENT_SECRET:
         st.warning(
-            "DeepGeo credentials not configured. "
-            "Add **DEEPGEO_USERNAME**, **DEEPGEO_PASSWORD**, **AWS_KEY_ID**, and **AWS_SECRET_KEY** to your .env file."
+            "DeepWalk API credentials not configured. "
+            "Add **DEEPWALK_AUTH0_CLIENT_ID**, **DEEPWALK_AUTH0_CLIENT_SECRET**, **DEEPWALK_AUTH0_AUDIENCE**, and **DEEPWALK_AUTH0_DOMAIN** to your .env file."
         )
         return
 
@@ -1786,8 +1816,8 @@ def render_scan_progress(deals: list[dict]):
     st.caption(f"{len(deals_with_project)} deal(s) with a DeepWalk Project ID")
 
     for d in deals_with_project:
-        p          = d.get("properties", {})
-        deal_name  = p.get("dealname") or d["id"]
+        p              = d.get("properties", {})
+        deal_name      = p.get("dealname") or d["id"]
         project_id_str = (p.get("project_id") or "").strip()
 
         try:
@@ -1800,33 +1830,37 @@ def render_scan_progress(deals: list[dict]):
                 with st.spinner("Loading scan data…"):
                     miles_by_stage = fetch_scan_miles_by_stage(project_id)
             except Exception as e:
-                st.error(f"Could not load scan data: {e}")
+                st.warning(f"Could not load scan data: {e}")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Collected",  "—")
+                c2.metric("In Progress", "—")
+                c3.metric("Completed",  "—")
                 continue
 
             if not miles_by_stage:
                 st.info("No scan data found for this project.")
                 continue
 
-            collected_miles  = sum(v for k, v in miles_by_stage.items() if k in COLLECTED_STAGES)
-            processing_miles = sum(v for k, v in miles_by_stage.items() if k in PROCESSING_STAGES)
-            completed_miles  = sum(v for k, v in miles_by_stage.items() if k in COMPLETED_STAGES)
+            visible = {k: v for k, v in miles_by_stage.items() if k not in _EXCLUDED_STAGES}
+            collected_miles  = sum(visible.values())
+            completed_miles  = visible.get("passed", 0.0)
+            in_progress_miles = collected_miles - completed_miles
 
             c1, c2, c3 = st.columns(3)
-            c1.metric("Collected",            f"{collected_miles:.2f} mi")
-            c2.metric("Processing",           f"{processing_miles:.2f} mi")
+            c1.metric("Collected",   f"{collected_miles:.2f} mi")
+            c2.metric("In Progress", f"{in_progress_miles:.2f} mi")
             pct = f"{completed_miles / collected_miles * 100:.0f}% of collected" if collected_miles else None
-            c3.metric("Completed (Billable)", f"{completed_miles:.2f} mi", delta=pct)
+            c3.metric("Completed",   f"{completed_miles:.2f} mi", delta=pct)
 
             with st.expander("Stage breakdown", expanded=False):
-                rows = []
-                for stage, miles in sorted(miles_by_stage.items(), key=lambda x: -x[1]):
-                    if stage in COMPLETED_STAGES:
-                        category = "Completed"
-                    elif stage in PROCESSING_STAGES:
-                        category = "Processing"
-                    else:
-                        category = "Other"
-                    rows.append({"Stage": stage, "Miles": f"{miles:.2f}", "Category": category})
+                rows = [
+                    {
+                        "Stage":    stage,
+                        "Miles":    f"{miles:.2f}",
+                        "Category": "Completed" if stage == "passed" else "In Progress",
+                    }
+                    for stage, miles in sorted(visible.items(), key=lambda x: -x[1])
+                ]
                 st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
@@ -1838,13 +1872,54 @@ def main():
         st.error("HUBSPOT_ACCESS_TOKEN not set in .env — cannot connect to HubSpot.")
         st.stop()
 
-    # ── OAuth authentication gate ─────────────────────────────────────────────
+    # ── Step 1: DeepWalk Auth0 gate ───────────────────────────────────────────
+    if DW_AUTH0_CLIENT_ID:
+        params = st.query_params
+
+        # Handle redirect back from DeepWalk Auth0
+        if "code" in params and params.get("state", "").startswith("dw-") \
+                and not st.session_state.get("dw_authenticated"):
+            code           = params["code"]
+            returned_state = params.get("state", "")
+
+            if returned_state != _dw_oauth_state():
+                st.error("Invalid state parameter — possible CSRF attempt. Please try again.")
+                st.query_params.clear()
+                st.stop()
+
+            try:
+                with st.spinner("Signing you in…"):
+                    tokens = dw_exchange_code(code)
+
+                st.session_state["dw_token"]         = tokens["access_token"]
+                st.session_state["dw_authenticated"] = True
+                st.query_params.clear()
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"DeepWalk authentication failed: {e}")
+                st.query_params.clear()
+                st.stop()
+
+        if not st.session_state.get("dw_authenticated"):
+            # Check if this is a silent re-auth bounce (prompt=none) that failed —
+            # Auth0 returns ?error=login_required in that case; fall back to interactive.
+            if params.get("error") == "login_required":
+                st.query_params.clear()
+                render_dw_login_page()
+            else:
+                # First visit or silent re-auth attempt
+                render_dw_login_page()
+            st.stop()
+
+    # ── Step 2: HubSpot OAuth gate ────────────────────────────────────────────
     if OAUTH_CLIENT_ID:
         params = st.query_params
 
         # Handle redirect back from HubSpot with auth code
-        if "code" in params and not st.session_state.get("authenticated"):
-            code          = params["code"]
+        if "code" in params and not params.get("state", "").startswith("dw-") \
+                and not st.session_state.get("authenticated"):
+            code           = params["code"]
             returned_state = params.get("state", "")
 
             if returned_state != _oauth_state():
@@ -1879,7 +1954,7 @@ def main():
         if not st.session_state.get("authenticated"):
             render_login_page()
             st.stop()
-    # Dev mode: no CLIENT_ID set → skip auth (local use with .env token only)
+    # Dev mode: no CLIENT_IDs set → skip auth (local use with .env token only)
 
     state = load_state()
 
@@ -1889,7 +1964,8 @@ def main():
         if OAUTH_CLIENT_ID and st.session_state.get("user_email"):
             st.caption(f"Signed in as {st.session_state['user_email']}")
             if st.button("Sign out"):
-                for k in ("authenticated", "user_email", "hub_id"):
+                for k in ("authenticated", "user_email", "hub_id",
+                          "dw_authenticated", "dw_token"):
                     st.session_state.pop(k, None)
                 st.rerun()
         else:
@@ -1903,8 +1979,6 @@ def main():
             fetch_invoiced_amounts_for_deal.clear()
             fetch_all_draft_invoices.clear()
             fetch_invoice_line_items.clear()
-            if DEEPGEO_AVAILABLE:
-                fetch_scan_miles_by_stage.clear()
             st.rerun()
 
         st.divider()

@@ -1946,12 +1946,11 @@ def main():
             st.session_state.pop("selected_deal_id", None)
             st.rerun()
 
-        if DEEPGEO_AVAILABLE:
-            if st.button("🗺️ Scan Progress",
-                         type="primary" if current_view == "scan_progress" else "secondary"):
-                st.session_state["view"] = "scan_progress"
-                st.session_state.pop("selected_deal_id", None)
-                st.rerun()
+        if st.button("🗺️ Scan Progress",
+                     type="primary" if current_view == "scan_progress" else "secondary"):
+            st.session_state["view"] = "scan_progress"
+            st.session_state.pop("selected_deal_id", None)
+            st.rerun()
 
     with st.spinner("Loading deals..."):
         try:

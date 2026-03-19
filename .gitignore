@@ -1,5 +1,6 @@
 # Secrets
 .env
+.streamlit/secrets.toml
 
 # Local state (regenerated at runtime)
 ar_state.json

@@ -1,0 +1,3 @@
+[submodule "DeepGeo"]
+	path = DeepGeo
+	url = https://github.com/DeepwalkInternal/DeepGeo.git

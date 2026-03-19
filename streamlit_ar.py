@@ -9,6 +9,7 @@ import os, json, secrets, hashlib, urllib.parse, requests
 from pathlib import Path
 from datetime import date, timedelta
 
+import sys
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -17,6 +18,30 @@ SCRIPT_DIR   = Path(__file__).parent
 STATE_FILE   = SCRIPT_DIR / "ar_state.json"
 
 load_dotenv(SCRIPT_DIR / ".env", override=True)
+
+# ── DeepGeo integration ────────────────────────────────────────────────────────
+sys.path.insert(0, str(SCRIPT_DIR / "DeepGeo"))
+try:
+    from DeepGeo.config import EnvConfig as DeepGeoEnvConfig
+    from DeepGeo.project import Project as DeepGeoProject
+    from DeepGeo.map_utils import get_length_from_line_gdf
+    DEEPGEO_AVAILABLE = True
+except ImportError:
+    DEEPGEO_AVAILABLE = False
+
+DEEPGEO_USERNAME = os.environ.get("DEEPGEO_USERNAME", "")
+DEEPGEO_PASSWORD = os.environ.get("DEEPGEO_PASSWORD", "")
+AWS_KEY_ID       = os.environ.get("AWS_KEY_ID", "")
+AWS_SECRET_KEY   = os.environ.get("AWS_SECRET_KEY", "")
+
+# Stages as defined by DeepWalk workflow
+COLLECTED_STAGES  = {
+    "passed", "rescan_check", "rescan_review", "auto_measurements",
+    "measurements_fix", "measurements_fix_ramp", "measurement_fix_review",
+    "obstruction_label", "panel_label", "ramp_label", "label_review",
+}
+COMPLETED_STAGES  = {"passed"}
+PROCESSING_STAGES = COLLECTED_STAGES - COMPLETED_STAGES
 
 HUBSPOT_TOKEN  = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
 BASE_URL       = "https://api.hubapi.com"
@@ -110,7 +135,7 @@ def raise_for_status(resp, context=""):
 @st.cache_data(ttl=300)
 def fetch_closed_won_deals() -> list[dict]:
     url   = f"{BASE_URL}/crm/v3/objects/deals/search"
-    props = ["dealname", "dealstage", "pipeline", "amount", "closedate", "createdate", "description"]
+    props = ["dealname", "dealstage", "pipeline", "amount", "closedate", "createdate", "description", "project_id"]
     all_deals, after, page = [], None, 1
     while True:
         body = {
@@ -824,18 +849,15 @@ def render_dashboard(deals: list[dict]):
 
 
 # ── Page: No deal selected (summary table) ────────────────────────────────────
-# Column proportions: Name | Amount | Billed | Open | Paid | Remaining | #Inv | #Draft | Close Date | Details | Invoice
-_COL_W = [2.8, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 0.55, 1.0, 0.75, 0.85]
-
 def render_summary(deals: list[dict], state: dict):
+    import pandas as pd
+
     st.subheader("Closed-Won Deals Summary")
     if not deals:
         st.info("No closed-won deals found.")
         return
 
-    search = st.text_input("🔍 Search deals...", "")
-
-    # Build all deal data (invoice totals computed live from HubSpot invoices)
+    # Build all deal data
     all_deal_data = []
     paid_off      = []
     with st.spinner("Loading invoice totals..."):
@@ -871,39 +893,70 @@ def render_summary(deals: list[dict], state: dict):
                 "description": p.get("description", ""),
             })
 
-    # Apply search filter
-    search_lower = search.strip().lower()
-    visible_deals = [dd for dd in all_deal_data
-                     if not search_lower or search_lower in dd["name"].lower()]
+    # ── Filter controls ───────────────────────────────────────────────────────
+    fc1, fc2, fc3 = st.columns([3, 1, 1])
+    search       = fc1.text_input("🔍 Search deals...", "")
+    only_drafts  = fc2.checkbox("Has drafts")
+    only_balance = fc3.checkbox("Has balance")
 
-    # Header row
-    hcols = st.columns(_COL_W)
-    for col, label in zip(hcols, ["Deal Name", "Amount", "Billed", "Open",
-                                   "Paid", "Remaining", "#Inv", "#Draft",
-                                   "Close Date", "", ""]):
-        col.markdown(f"**{label}**")
-    st.divider()
+    search_lower  = search.strip().lower()
+    visible_deals = [
+        dd for dd in all_deal_data
+        if (not search_lower or search_lower in dd["name"].lower())
+        and (not only_drafts  or dd["drafts"] > 0)
+        and (not only_balance or dd["remaining"] > 0)
+    ]
 
-    # Data rows
-    for dd in visible_deals:
-        cols = st.columns(_COL_W)
-        cols[0].write(dd["name"])
-        cols[1].write(f"${dd['amount']:,.0f}")
-        cols[2].write(f"${dd['billed']:,.0f}")
-        cols[3].write(f"${dd['open']:,.0f}")
-        cols[4].write(f"${dd['paid']:,.0f}")
-        rem_str = f"${dd['remaining']:,.0f}"
-        cols[5].write(f"**{rem_str}**" if dd["remaining"] <= 0 else rem_str)
-        cols[6].write(str(dd["count"]))
-        draft_str = str(dd["drafts"]) if dd["drafts"] else "—"
-        cols[7].write(f"**{draft_str}**" if dd["drafts"] else draft_str)
-        cols[8].write(dd["closedate"][:10] if dd["closedate"] else "—")
+    if not visible_deals:
+        st.info("No deals match the current filters.")
+        return
+
+    # ── Sortable / filterable dataframe ──────────────────────────────────────
+    df = pd.DataFrame([
+        {
+            "Deal Name":  dd["name"],
+            "Amount":     dd["amount"],
+            "Billed":     dd["billed"],
+            "Open":       dd["open"],
+            "Paid":       dd["paid"],
+            "Remaining":  dd["remaining"],
+            "Invoices":   dd["count"],
+            "Drafts":     dd["drafts"],
+            "Close Date": dd["closedate"][:10] if dd["closedate"] else "",
+        }
+        for dd in visible_deals
+    ])
+
+    event = st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        column_config={
+            "Deal Name":  st.column_config.TextColumn("Deal Name",  pinned=True),
+            "Amount":     st.column_config.NumberColumn("Amount",     format="$%.0f"),
+            "Billed":     st.column_config.NumberColumn("Billed",     format="$%.0f"),
+            "Open":       st.column_config.NumberColumn("Open",       format="$%.0f"),
+            "Paid":       st.column_config.NumberColumn("Paid",       format="$%.0f"),
+            "Remaining":  st.column_config.NumberColumn("Remaining",  format="$%.0f"),
+        },
+    )
+
+    # ── Row-selection actions ─────────────────────────────────────────────────
+    selected_rows = event.selection.rows if event and event.selection else []
+    if selected_rows:
+        dd = visible_deals[selected_rows[0]]
+        st.divider()
+        st.markdown(f"**Selected:** {dd['name']}")
+        ca, cb = st.columns(2)
 
         det_key = f"show_det_{dd['id']}"
-        if cols[9].button("Details", key=f"det_btn_{dd['id']}"):
+        if ca.button("Details", key=f"det_btn_{dd['id']}", use_container_width=True):
             st.session_state[det_key] = not st.session_state.get(det_key, False)
 
-        if cols[10].button("Invoice →", key=f"inv_btn_{dd['id']}"):
+        if cb.button("Invoice →", key=f"inv_btn_{dd['id']}",
+                     type="primary", use_container_width=True):
             st.session_state["selected_deal_id"]     = dd["id"]
             st.session_state["selected_deal_amount"] = dd["amount"]
             st.session_state["view"]                 = "deal"
@@ -1682,6 +1735,101 @@ def render_drafts_view(deal_lookup: dict):
                 _render_draft_invoice_row(draft)
 
 
+# ── DeepGeo: scan mileage fetch ────────────────────────────────────────────────
+@st.cache_data(ttl=300)
+def fetch_scan_miles_by_stage(project_id: int) -> dict:
+    """Returns {stage: miles} for all scans in the project via DeepGeo."""
+    env = DeepGeoEnvConfig(
+        username=DEEPGEO_USERNAME,
+        password=DEEPGEO_PASSWORD,
+        AWS_KEY_ID=AWS_KEY_ID,
+        AWS_SECRET_KEY=AWS_SECRET_KEY,
+    )
+    project  = DeepGeoProject(project_id=project_id, env_config=env)
+    line_gdf, _ = project.scan_geodataframe()
+    if line_gdf is None or line_gdf.empty or "stage" not in line_gdf.columns:
+        return {}
+    result = {}
+    for stage, group in line_gdf.groupby("stage"):
+        try:
+            _, miles = get_length_from_line_gdf(group)
+            result[str(stage)] = round(float(miles), 2)
+        except Exception:
+            pass
+    return result
+
+
+# ── Page: Scan Progress ────────────────────────────────────────────────────────
+def render_scan_progress(deals: list[dict]):
+    st.header("Scan Progress")
+
+    if not DEEPGEO_AVAILABLE:
+        st.error("DeepGeo library could not be imported. Check that the DeepGeo submodule is initialised.")
+        return
+
+    if not DEEPGEO_USERNAME or not AWS_KEY_ID:
+        st.warning(
+            "DeepGeo credentials not configured. "
+            "Add **DEEPGEO_USERNAME**, **DEEPGEO_PASSWORD**, **AWS_KEY_ID**, and **AWS_SECRET_KEY** to your .env file."
+        )
+        return
+
+    deals_with_project = [
+        d for d in deals
+        if (d.get("properties", {}).get("project_id") or "").strip()
+    ]
+
+    if not deals_with_project:
+        st.info("No closed-won deals have a DeepWalk Project ID set.")
+        return
+
+    st.caption(f"{len(deals_with_project)} deal(s) with a DeepWalk Project ID")
+
+    for d in deals_with_project:
+        p          = d.get("properties", {})
+        deal_name  = p.get("dealname") or d["id"]
+        project_id_str = (p.get("project_id") or "").strip()
+
+        try:
+            project_id = int(project_id_str)
+        except (ValueError, TypeError):
+            continue
+
+        with st.expander(f"**{deal_name}** — Project #{project_id}", expanded=True):
+            try:
+                with st.spinner("Loading scan data…"):
+                    miles_by_stage = fetch_scan_miles_by_stage(project_id)
+            except Exception as e:
+                st.error(f"Could not load scan data: {e}")
+                continue
+
+            if not miles_by_stage:
+                st.info("No scan data found for this project.")
+                continue
+
+            collected_miles  = sum(v for k, v in miles_by_stage.items() if k in COLLECTED_STAGES)
+            processing_miles = sum(v for k, v in miles_by_stage.items() if k in PROCESSING_STAGES)
+            completed_miles  = sum(v for k, v in miles_by_stage.items() if k in COMPLETED_STAGES)
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Collected",            f"{collected_miles:.2f} mi")
+            c2.metric("Processing",           f"{processing_miles:.2f} mi")
+            pct = f"{completed_miles / collected_miles * 100:.0f}% of collected" if collected_miles else None
+            c3.metric("Completed (Billable)", f"{completed_miles:.2f} mi", delta=pct)
+
+            with st.expander("Stage breakdown", expanded=False):
+                rows = []
+                for stage, miles in sorted(miles_by_stage.items(), key=lambda x: -x[1]):
+                    if stage in COMPLETED_STAGES:
+                        category = "Completed"
+                    elif stage in PROCESSING_STAGES:
+                        category = "Processing"
+                    else:
+                        category = "Other"
+                    rows.append({"Stage": stage, "Miles": f"{miles:.2f}", "Category": category})
+                st.dataframe(rows, use_container_width=True, hide_index=True)
+
+
 # ── Main app ───────────────────────────────────────────────────────────────────
 def main():
     st.set_page_config(page_title="Accounts Receivable", page_icon="💰", layout="wide")
@@ -1755,6 +1903,8 @@ def main():
             fetch_invoiced_amounts_for_deal.clear()
             fetch_all_draft_invoices.clear()
             fetch_invoice_line_items.clear()
+            if DEEPGEO_AVAILABLE:
+                fetch_scan_miles_by_stage.clear()
             st.rerun()
 
         st.divider()
@@ -1796,6 +1946,13 @@ def main():
             st.session_state.pop("selected_deal_id", None)
             st.rerun()
 
+        if DEEPGEO_AVAILABLE:
+            if st.button("🗺️ Scan Progress",
+                         type="primary" if current_view == "scan_progress" else "secondary"):
+                st.session_state["view"] = "scan_progress"
+                st.session_state.pop("selected_deal_id", None)
+                st.rerun()
+
     with st.spinner("Loading deals..."):
         try:
             deals = fetch_closed_won_deals()
@@ -1820,6 +1977,10 @@ def main():
 
     if view == "li_config":
         render_global_line_item_config(deals, state)
+        return
+
+    if view == "scan_progress":
+        render_scan_progress(deals)
         return
 
     if view == "drafts":

@@ -443,6 +443,49 @@ def fetch_invoice_line_items(invoice_id: str) -> list[dict]:
     raise_for_status(r, "batch/read invoice line_items")
     return r.json().get("results", [])
 
+
+@st.cache_data(ttl=300)
+def fetch_mileage_invoiced_for_deal(deal_id: str, mileage_names: tuple) -> tuple:
+    """Returns (billed_miles, paid_miles) for mileage line items across all non-void/draft invoices."""
+    if not mileage_names:
+        return 0.0, 0.0
+    invoices = fetch_invoices_for_deal(deal_id)
+    billed = 0.0
+    paid   = 0.0
+    for inv in invoices:
+        status = (inv.get("properties", {}).get("hs_invoice_status") or "").upper()
+        if status in EXCLUDE_STATUSES:
+            continue
+        line_items = fetch_invoice_line_items(inv["id"])
+        for li in line_items:
+            lp = li.get("properties", {})
+            if lp.get("name", "").strip() not in mileage_names:
+                continue
+            qty = float(lp.get("quantity") or 0)
+            billed += qty
+            if status in PAID_STATUSES:
+                paid += qty
+    return billed, paid
+
+
+@st.cache_data(ttl=300)
+def fetch_collected_miles_cached(project_id: int, dw_token: str) -> float:
+    """Fetch total collected (non-archived) miles from DeepWalk API. Token passed as param for caching."""
+    if not dw_token or not project_id:
+        return 0.0
+    try:
+        resp = requests.get(
+            f"https://app.deepwalkresearch.com/api/project/{project_id}/mileage/detailed",
+            headers={"Authorization": f"Bearer {dw_token}"},
+        )
+        if not resp.ok:
+            return 0.0
+        miles_by_stage = {str(k): float(v) for k, v in resp.json().items()}
+        return sum(v for k, v in miles_by_stage.items() if k not in _EXCLUDED_STAGES)
+    except Exception:
+        return 0.0
+
+
 # ── Pipeline stages ────────────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
 def fetch_deal_stages() -> list[dict]:
@@ -586,6 +629,55 @@ def create_invoice_in_hubspot(deal_id: str, line_items_to_bill: list[dict],
 
     return invoice_id, invoice_link, hs_number
 
+def get_deal_mileage_summary(deal: dict, state: dict) -> dict | None:
+    """
+    Returns mileage summary dict for a deal, or None if the deal has no mileage line items.
+    Keys: contracted, collected, billed, paid  (all floats, in miles)
+    """
+    deal_id  = deal["id"]
+    li_types = state["line_item_types"]
+    try:
+        line_items = fetch_line_items_for_deal(deal_id)
+    except Exception:
+        return None
+
+    mileage_names = tuple(
+        (li.get("properties", {}).get("name") or "").strip()
+        for li in line_items
+        if li_types.get(li["id"], "standard") == "mileage"
+    )
+    if not mileage_names:
+        return None
+
+    contracted = sum(
+        float((li.get("properties", {}).get("quantity")) or 0)
+        for li in line_items
+        if li_types.get(li["id"], "standard") == "mileage"
+    )
+
+    try:
+        billed, paid = fetch_mileage_invoiced_for_deal(deal_id, mileage_names)
+    except Exception:
+        billed = paid = 0.0
+
+    project_id_str = (deal.get("properties", {}).get("project_id") or "").strip()
+    collected = 0.0
+    if project_id_str:
+        try:
+            collected = fetch_collected_miles_cached(
+                int(project_id_str), st.session_state.get("dw_token", "")
+            )
+        except (ValueError, Exception):
+            collected = 0.0
+
+    return {
+        "contracted": contracted,
+        "collected":  collected,
+        "billed":     billed,
+        "paid":       paid,
+    }
+
+
 # ── Deal details inline panel ──────────────────────────────────────────────────
 def render_deal_details_panel(deal_data: dict, state: dict):
     """Inline details panel rendered below a summary row."""
@@ -618,6 +710,19 @@ def render_deal_details_panel(deal_data: dict, state: dict):
     c3.metric("Open",         f"${p['open']:,.0f}")
     c4.metric("Paid",         f"${p['paid']:,.0f}")
     c5.metric("Remaining",    f"${p['remaining']:,.0f}")
+
+    # Mileage metrics row (only shown for deals with mileage line items)
+    _deal_obj = {"id": p["id"], "properties": p}
+    _mi = get_deal_mileage_summary(_deal_obj, state)
+    if _mi:
+        st.markdown("**Mileage**")
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Contracted",      f"{_mi['contracted']:g} mi")
+        m2.metric("Collected",       f"{_mi['collected']:.2f} mi")
+        m3.metric("Billed",          f"{_mi['billed']:g} mi",
+                  delta=f"{_mi['billed']/_mi['collected']*100:.0f}% of collected" if _mi['collected'] else None)
+        m4.metric("Paid",            f"{_mi['paid']:g} mi")
+        m5.metric("Remaining to Bill", f"{max(_mi['contracted'] - _mi['billed'], 0):g} mi")
 
     st.markdown("**Line Items**")
     try:
@@ -718,7 +823,7 @@ def render_deal_details_panel(deal_data: dict, state: dict):
 
 
 # ── Page: AR Dashboard ─────────────────────────────────────────────────────────
-def render_dashboard(deals: list[dict]):
+def render_dashboard(deals: list[dict], state: dict):
     st.header("AR Dashboard")
     today = date.today()
 
@@ -889,6 +994,58 @@ def render_dashboard(deals: list[dict]):
         use_container_width=True, hide_index=True,
     )
 
+    # ── Mileage Overview ──────────────────────────────────────────────────────
+    if DW_AUTH0_CLIENT_ID:
+        st.divider()
+        st.subheader("Mileage Overview")
+        mi_rows = []
+        total_mi_contracted = total_mi_collected = total_mi_billed = total_mi_paid = 0.0
+        with st.spinner("Loading mileage data…"):
+            for d in deals:
+                mi = get_deal_mileage_summary(d, state)
+                if not mi:
+                    continue
+                deal_name = d.get("properties", {}).get("dealname") or "(unnamed)"
+                mi_rows.append({
+                    "Deal":         deal_name,
+                    "Contracted":   mi["contracted"],
+                    "Collected":    mi["collected"],
+                    "Billed":       mi["billed"],
+                    "Paid":         mi["paid"],
+                    "Unbilled":     max(mi["contracted"] - mi["billed"], 0),
+                    "% Collected":  (mi["collected"] / mi["contracted"] * 100) if mi["contracted"] else 0.0,
+                    "% Billed":     (mi["billed"] / mi["collected"] * 100) if mi["collected"] else 0.0,
+                })
+                total_mi_contracted += mi["contracted"]
+                total_mi_collected  += mi["collected"]
+                total_mi_billed     += mi["billed"]
+                total_mi_paid       += mi["paid"]
+
+        if mi_rows:
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total Contracted", f"{total_mi_contracted:,.1f} mi")
+            m2.metric("Total Collected",  f"{total_mi_collected:,.1f} mi",
+                      delta=f"{total_mi_collected/total_mi_contracted*100:.0f}% of contracted" if total_mi_contracted else None)
+            m3.metric("Total Billed",     f"{total_mi_billed:,.1f} mi",
+                      delta=f"{total_mi_billed/total_mi_collected*100:.0f}% of collected" if total_mi_collected else None)
+            m4.metric("Total Paid",       f"{total_mi_paid:,.1f} mi")
+
+            st.dataframe(
+                [{
+                    "Deal":        r["Deal"],
+                    "Contracted":  f"{r['Contracted']:,.1f} mi",
+                    "Collected":   f"{r['Collected']:,.1f} mi",
+                    "% Collected": f"{r['% Collected']:.0f}%",
+                    "Billed":      f"{r['Billed']:,.1f} mi",
+                    "% Billed":    f"{r['% Billed']:.0f}%",
+                    "Paid":        f"{r['Paid']:,.1f} mi",
+                    "Unbilled":    f"{r['Unbilled']:,.1f} mi",
+                } for r in sorted(mi_rows, key=lambda x: x["Contracted"], reverse=True)],
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            st.info("No deals with mileage line items found.")
+
 
 # ── Page: No deal selected (summary table) ────────────────────────────────────
 def render_summary(deals: list[dict], state: dict):
@@ -919,6 +1076,7 @@ def render_summary(deals: list[dict], state: dict):
             remaining = amount - paid
             if remaining <= 0:
                 paid_off.append((deal_id, name))
+            mi_summary = get_deal_mileage_summary(d, state)
             all_deal_data.append({
                 "id":          deal_id,
                 "name":        name,
@@ -933,6 +1091,11 @@ def render_summary(deals: list[dict], state: dict):
                 "closedate":   p.get("closedate", ""),
                 "createdate":  p.get("createdate", ""),
                 "description": p.get("description", ""),
+                "project_id":       p.get("project_id", ""),
+                "mi_contracted":    mi_summary["contracted"] if mi_summary else None,
+                "mi_collected":     mi_summary["collected"]  if mi_summary else None,
+                "mi_billed":        mi_summary["billed"]     if mi_summary else None,
+                "mi_paid":          mi_summary["paid"]       if mi_summary else None,
             })
 
     # ── Filter controls ───────────────────────────────────────────────────────
@@ -954,8 +1117,11 @@ def render_summary(deals: list[dict], state: dict):
         return
 
     # ── Sortable / filterable dataframe ──────────────────────────────────────
-    df = pd.DataFrame([
-        {
+    has_mileage = any(dd["mi_contracted"] is not None for dd in visible_deals)
+
+    df_rows = []
+    for dd in visible_deals:
+        row = {
             "Deal Name":  dd["name"],
             "Amount":     dd["amount"],
             "Billed":     dd["billed"],
@@ -966,8 +1132,28 @@ def render_summary(deals: list[dict], state: dict):
             "Drafts":     dd["drafts"],
             "Close Date": dd["closedate"][:10] if dd["closedate"] else "",
         }
-        for dd in visible_deals
-    ])
+        if has_mileage:
+            row["Contracted Mi"] = dd["mi_contracted"] if dd["mi_contracted"] is not None else 0.0
+            row["Collected Mi"]  = dd["mi_collected"]  if dd["mi_collected"]  is not None else 0.0
+            row["Billed Mi"]     = dd["mi_billed"]     if dd["mi_billed"]     is not None else 0.0
+            row["Paid Mi"]       = dd["mi_paid"]       if dd["mi_paid"]       is not None else 0.0
+        df_rows.append(row)
+
+    df = pd.DataFrame(df_rows)
+
+    col_config = {
+        "Deal Name":  st.column_config.TextColumn("Deal Name",  pinned=True),
+        "Amount":     st.column_config.NumberColumn("Amount",     format="$%.0f"),
+        "Billed":     st.column_config.NumberColumn("Billed",     format="$%.0f"),
+        "Open":       st.column_config.NumberColumn("Open",       format="$%.0f"),
+        "Paid":       st.column_config.NumberColumn("Paid",       format="$%.0f"),
+        "Remaining":  st.column_config.NumberColumn("Remaining",  format="$%.0f"),
+    }
+    if has_mileage:
+        col_config["Contracted Mi"] = st.column_config.NumberColumn("Contracted Mi", format="%.1f mi")
+        col_config["Collected Mi"]  = st.column_config.NumberColumn("Collected Mi",  format="%.1f mi")
+        col_config["Billed Mi"]     = st.column_config.NumberColumn("Billed Mi",     format="%.1f mi")
+        col_config["Paid Mi"]       = st.column_config.NumberColumn("Paid Mi",       format="%.1f mi")
 
     event = st.dataframe(
         df,
@@ -975,14 +1161,7 @@ def render_summary(deals: list[dict], state: dict):
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
-        column_config={
-            "Deal Name":  st.column_config.TextColumn("Deal Name",  pinned=True),
-            "Amount":     st.column_config.NumberColumn("Amount",     format="$%.0f"),
-            "Billed":     st.column_config.NumberColumn("Billed",     format="$%.0f"),
-            "Open":       st.column_config.NumberColumn("Open",       format="$%.0f"),
-            "Paid":       st.column_config.NumberColumn("Paid",       format="$%.0f"),
-            "Remaining":  st.column_config.NumberColumn("Remaining",  format="$%.0f"),
-        },
+        column_config=col_config,
     )
 
     # ── Row-selection actions ─────────────────────────────────────────────────
@@ -999,10 +1178,11 @@ def render_summary(deals: list[dict], state: dict):
 
         if cb.button("Invoice →", key=f"inv_btn_{dd['id']}",
                      type="primary", use_container_width=True):
-            st.session_state["selected_deal_id"]     = dd["id"]
-            st.session_state["selected_deal_amount"] = dd["amount"]
-            st.session_state["view"]                 = "deal"
-            st.session_state["goto_invoice_tab"]     = True
+            st.session_state["selected_deal_id"]         = dd["id"]
+            st.session_state["selected_deal_amount"]     = dd["amount"]
+            st.session_state["selected_deal_project_id"] = dd.get("project_id", "")
+            st.session_state["view"]                     = "deal"
+            st.session_state["goto_invoice_tab"]         = True
             st.rerun()
 
         if st.session_state.get(det_key, False):
@@ -1315,12 +1495,26 @@ def render_create_invoice_tab(deal_id: str, line_items: list[dict], state: dict)
             billed_miles = inv_data.get("quantity", 0.0)
             contracted   = qty
             remaining_m  = contracted - billed_miles
+            # Collected miles from DeepWalk
+            _project_id_str = (
+                st.session_state.get("selected_deal_project_id", "") or ""
+            ).strip()
+            _collected_mi = 0.0
+            if _project_id_str:
+                try:
+                    _collected_mi = fetch_collected_miles_cached(
+                        int(_project_id_str), st.session_state.get("dw_token", "")
+                    )
+                except (ValueError, Exception):
+                    _collected_mi = 0.0
             st.markdown(f"**{name}** — Mileage  (${unit_p:,.4f}/mile)")
-            st.caption(
-                f"Contracted: {contracted:g} mi  ·  "
-                f"Billed to date: {billed_miles:g} mi  ·  "
-                f"Remaining: {remaining_m:g} mi"
-            )
+            _caption_parts = [
+                f"Contracted: {contracted:g} mi",
+                f"Collected: {_collected_mi:.2f} mi" if _project_id_str else None,
+                f"Billed to date: {billed_miles:g} mi",
+                f"Remaining: {remaining_m:g} mi",
+            ]
+            st.caption("  ·  ".join(p for p in _caption_parts if p))
             mi_all = st.checkbox(
                 "Bill all remaining",
                 value=(remaining_m > 0),
@@ -2055,7 +2249,7 @@ def main():
         view = "deal"
 
     if view == "dashboard":
-        render_dashboard(deals)
+        render_dashboard(deals, state)
         return
 
     if view == "li_config":

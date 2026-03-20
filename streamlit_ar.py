@@ -27,7 +27,6 @@ DW_AUTH0_CLIENT_ID     = os.environ.get("DEEPWALK_AUTH0_CLIENT_ID", "")
 DW_AUTH0_CLIENT_SECRET = os.environ.get("DEEPWALK_AUTH0_CLIENT_SECRET", "")
 DW_AUTH0_DOMAIN        = os.environ.get("DEEPWALK_AUTH0_DOMAIN", "")
 DW_AUTH0_AUDIENCE      = os.environ.get("DEEPWALK_AUTH0_AUDIENCE", "")
-DW_AUTH0_REDIRECT_URI  = os.environ.get("DEEPWALK_AUTH0_REDIRECT_URI", "http://localhost:8501")
 
 HUBSPOT_TOKEN  = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
 BASE_URL       = "https://api.hubapi.com"
@@ -109,55 +108,20 @@ def render_login_page():
     st.link_button("Sign in with HubSpot", oauth_auth_url(), type="primary")
     st.caption("You'll be redirected to HubSpot to authorize access.")
 
-# ── DeepWalk OAuth helpers ────────────────────────────────────────────────────
-def _dw_oauth_state() -> str:
-    """Deterministic state token for DeepWalk OAuth — prefixed to distinguish from HubSpot."""
-    return "dw-" + hashlib.sha256(f"dw-oauth-{DW_AUTH0_CLIENT_SECRET}".encode()).hexdigest()[:28]
-
-def dw_auth_url() -> str:
-    return f"https://{DW_AUTH0_DOMAIN}/authorize?" + urllib.parse.urlencode({
-        "client_id":     DW_AUTH0_CLIENT_ID,
-        "redirect_uri":  DW_AUTH0_REDIRECT_URI,
-        "response_type": "code",
-        "scope":         "openid profile email",
-        "audience":      DW_AUTH0_AUDIENCE,
-        "state":         _dw_oauth_state(),
-        "prompt":        "none",
-    })
-
-def dw_auth_url_interactive() -> str:
-    """Same as dw_auth_url but without prompt=none — used for first login."""
-    return f"https://{DW_AUTH0_DOMAIN}/authorize?" + urllib.parse.urlencode({
-        "client_id":     DW_AUTH0_CLIENT_ID,
-        "redirect_uri":  DW_AUTH0_REDIRECT_URI,
-        "response_type": "code",
-        "scope":         "openid profile email",
-        "audience":      DW_AUTH0_AUDIENCE,
-        "state":         _dw_oauth_state(),
-    })
-
-def dw_exchange_code(code: str) -> dict:
-    """Exchange a DeepWalk Auth0 authorization code for tokens."""
+# ── DeepWalk client-credentials token fetch ───────────────────────────────────
+def fetch_dw_token() -> str:
+    """Obtain a DeepWalk API token via client credentials (no browser redirect)."""
     r = requests.post(
         f"https://{DW_AUTH0_DOMAIN}/oauth/token",
         json={
-            "grant_type":    "authorization_code",
+            "grant_type":    "client_credentials",
             "client_id":     DW_AUTH0_CLIENT_ID,
             "client_secret": DW_AUTH0_CLIENT_SECRET,
-            "redirect_uri":  DW_AUTH0_REDIRECT_URI,
-            "code":          code,
+            "audience":      DW_AUTH0_AUDIENCE,
         },
     )
     r.raise_for_status()
-    return r.json()
-
-def render_dw_login_page():
-    st.set_page_config(page_title="Sign In — AR", page_icon="💰", layout="centered")
-    st.title("💰 Accounts Receivable")
-    st.markdown("Sign in with your DeepWalk account to continue.")
-    st.divider()
-    st.link_button("Sign in with DeepWalk", dw_auth_url_interactive(), type="primary")
-    st.caption("You'll be redirected to DeepWalk to authorize access.")
+    return r.json()["access_token"]
 
 # ── HubSpot helpers ────────────────────────────────────────────────────────────
 def raise_for_status(resp, context=""):
@@ -1785,9 +1749,8 @@ def fetch_scan_miles_by_stage(project_id: int) -> dict:
         headers={"Authorization": f"Bearer {token}"},
     )
     if resp.status_code == 401:
-        # Token expired — clear session and trigger silent re-auth
+        # Token expired — clear and re-fetch on next run
         st.session_state.pop("dw_token", None)
-        st.session_state.pop("dw_authenticated", None)
         st.rerun()
     resp.raise_for_status()
     return {str(k): float(v) for k, v in resp.json().items()}
@@ -1872,44 +1835,12 @@ def main():
         st.error("HUBSPOT_ACCESS_TOKEN not set in .env — cannot connect to HubSpot.")
         st.stop()
 
-    # ── Step 1: DeepWalk Auth0 gate ───────────────────────────────────────────
-    if DW_AUTH0_CLIENT_ID:
-        params = st.query_params
-
-        # Handle redirect back from DeepWalk Auth0
-        if "code" in params and params.get("state", "").startswith("dw-") \
-                and not st.session_state.get("dw_authenticated"):
-            code           = params["code"]
-            returned_state = params.get("state", "")
-
-            if returned_state != _dw_oauth_state():
-                st.error("Invalid state parameter — possible CSRF attempt. Please try again.")
-                st.query_params.clear()
-                st.stop()
-
-            try:
-                with st.spinner("Signing you in…"):
-                    tokens = dw_exchange_code(code)
-
-                st.session_state["dw_token"]         = tokens["access_token"]
-                st.session_state["dw_authenticated"] = True
-                st.query_params.clear()
-                st.rerun()
-
-            except Exception as e:
-                st.error(f"DeepWalk authentication failed: {e}")
-                st.query_params.clear()
-                st.stop()
-
-        if not st.session_state.get("dw_authenticated"):
-            # Check if this is a silent re-auth bounce (prompt=none) that failed —
-            # Auth0 returns ?error=login_required in that case; fall back to interactive.
-            if params.get("error") == "login_required":
-                st.query_params.clear()
-                render_dw_login_page()
-            else:
-                # First visit or silent re-auth attempt
-                render_dw_login_page()
+    # ── Step 1: DeepWalk token (client credentials — no browser redirect) ────────
+    if DW_AUTH0_CLIENT_ID and not st.session_state.get("dw_token"):
+        try:
+            st.session_state["dw_token"] = fetch_dw_token()
+        except Exception as e:
+            st.error(f"Could not obtain DeepWalk API token: {e}")
             st.stop()
 
     # ── Step 2: HubSpot OAuth gate ────────────────────────────────────────────
@@ -1964,8 +1895,7 @@ def main():
         if OAUTH_CLIENT_ID and st.session_state.get("user_email"):
             st.caption(f"Signed in as {st.session_state['user_email']}")
             if st.button("Sign out"):
-                for k in ("authenticated", "user_email", "hub_id",
-                          "dw_authenticated", "dw_token"):
+                for k in ("authenticated", "user_email", "hub_id", "dw_token"):
                     st.session_state.pop(k, None)
                 st.rerun()
         else:

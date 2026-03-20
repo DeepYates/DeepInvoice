@@ -480,7 +480,7 @@ def fetch_collected_miles_cached(project_id: int, dw_token: str) -> float:
         )
         if not resp.ok:
             return 0.0
-        miles_by_stage = {str(k): float(v) for k, v in resp.json().items()}
+        miles_by_stage = {str(k): float(v) for k, v in resp.json().items() if v is not None}
         return sum(v for k, v in miles_by_stage.items() if k not in _EXCLUDED_STAGES)
     except Exception:
         return 0.0
@@ -1991,7 +1991,7 @@ def fetch_scan_miles_by_stage(project_id: int) -> dict:
         st.session_state.pop("dw_token", None)
         st.rerun()
     resp.raise_for_status()
-    return {str(k): float(v) for k, v in resp.json().items()}
+    return {str(k): float(v) for k, v in resp.json().items() if v is not None}
 
 
 # ── Page: Scan Progress ────────────────────────────────────────────────────────

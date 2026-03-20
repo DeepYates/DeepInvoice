@@ -641,10 +641,14 @@ def get_deal_mileage_summary(deal: dict, state: dict) -> dict | None:
     except Exception:
         return None
 
+    def _li_type(li):
+        # Local state takes priority; fall back to ar_li_type stored in HubSpot
+        return li_types.get(li["id"]) or (li.get("properties", {}).get("ar_li_type") or "standard")
+
     mileage_names = tuple(
         (li.get("properties", {}).get("name") or "").strip()
         for li in line_items
-        if li_types.get(li["id"], "standard") == "mileage"
+        if _li_type(li) == "mileage"
     )
     if not mileage_names:
         return None
@@ -652,7 +656,7 @@ def get_deal_mileage_summary(deal: dict, state: dict) -> dict | None:
     contracted = sum(
         float((li.get("properties", {}).get("quantity")) or 0)
         for li in line_items
-        if li_types.get(li["id"], "standard") == "mileage"
+        if _li_type(li) == "mileage"
     )
 
     try:

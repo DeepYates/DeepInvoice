@@ -8,6 +8,7 @@ Run: streamlit run streamlit_ar.py
 import os
 import json
 import hashlib
+import secrets
 import urllib.parse
 import requests
 from pathlib import Path
@@ -27,6 +28,7 @@ DW_AUTH0_CLIENT_ID     = os.environ.get("DEEPWALK_AUTH0_CLIENT_ID", "")
 DW_AUTH0_CLIENT_SECRET = os.environ.get("DEEPWALK_AUTH0_CLIENT_SECRET", "")
 DW_AUTH0_DOMAIN        = os.environ.get("DEEPWALK_AUTH0_DOMAIN", "")
 DW_AUTH0_AUDIENCE      = os.environ.get("DEEPWALK_AUTH0_AUDIENCE", "")
+DW_AUTH0_REDIRECT_URI  = os.environ.get("DEEPWALK_AUTH0_REDIRECT_URI", "http://localhost:8501")
 
 HUBSPOT_TOKEN  = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
 BASE_URL       = "https://api.hubapi.com"
@@ -69,12 +71,15 @@ def _oauth_state() -> str:
     """Deterministic state token derived from the client secret — survives server restarts."""
     return hashlib.sha256(f"ar-oauth-{OAUTH_CLIENT_SECRET}".encode()).hexdigest()[:32]
 
-def oauth_auth_url() -> str:
+def oauth_auth_url(dw_session_key: str = "") -> str:
+    # Embed the dw_session_key into state so we can recover the DeepWalk token
+    # after the HubSpot redirect even if Streamlit session state was lost.
+    state = _oauth_state() + (":" + dw_session_key if dw_session_key else "")
     return "https://app.hubspot.com/oauth/authorize?" + urllib.parse.urlencode({
         "client_id":    OAUTH_CLIENT_ID,
         "redirect_uri": OAUTH_REDIRECT_URI,
         "scope":        OAUTH_SCOPES,
-        "state":        _oauth_state(),
+        "state":        state,
     })
 
 def oauth_exchange_code(code: str) -> dict:
@@ -104,24 +109,49 @@ def render_login_page():
     st.title("💰 Accounts Receivable")
     st.markdown("Sign in with your HubSpot account to continue.")
     st.divider()
-
-    st.link_button("Sign in with HubSpot", oauth_auth_url(), type="primary")
+    dw_session_key = st.session_state.get("dw_session_key", "")
+    st.link_button("Sign in with HubSpot", oauth_auth_url(dw_session_key), type="primary")
     st.caption("You'll be redirected to HubSpot to authorize access.")
 
-# ── DeepWalk client-credentials token fetch ───────────────────────────────────
-def fetch_dw_token() -> str:
-    """Obtain a DeepWalk API token via client credentials (no browser redirect)."""
+# ── DeepWalk OAuth helpers ────────────────────────────────────────────────────
+# Server-side store: dw_session_key -> dw_access_token
+# Survives the HubSpot redirect even when Streamlit session state is lost.
+_dw_token_store: dict = {}
+
+def _dw_oauth_state() -> str:
+    return "dw-" + hashlib.sha256(f"dw-oauth-{DW_AUTH0_CLIENT_SECRET}".encode()).hexdigest()[:28]
+
+def dw_auth_url_interactive() -> str:
+    return f"https://{DW_AUTH0_DOMAIN}/authorize?" + urllib.parse.urlencode({
+        "client_id":     DW_AUTH0_CLIENT_ID,
+        "redirect_uri":  DW_AUTH0_REDIRECT_URI,
+        "response_type": "code",
+        "scope":         "openid profile email",
+        "audience":      DW_AUTH0_AUDIENCE,
+        "state":         _dw_oauth_state(),
+    })
+
+def dw_exchange_code(code: str) -> dict:
     r = requests.post(
         f"https://{DW_AUTH0_DOMAIN}/oauth/token",
         json={
-            "grant_type":    "client_credentials",
+            "grant_type":    "authorization_code",
             "client_id":     DW_AUTH0_CLIENT_ID,
             "client_secret": DW_AUTH0_CLIENT_SECRET,
-            "audience":      DW_AUTH0_AUDIENCE,
+            "redirect_uri":  DW_AUTH0_REDIRECT_URI,
+            "code":          code,
         },
     )
     r.raise_for_status()
-    return r.json()["access_token"]
+    return r.json()
+
+def render_dw_login_page():
+    st.set_page_config(page_title="Sign In — AR", page_icon="💰", layout="centered")
+    st.title("💰 Accounts Receivable")
+    st.markdown("Sign in with your DeepWalk account to continue.")
+    st.divider()
+    st.link_button("Sign in with DeepWalk", dw_auth_url_interactive(), type="primary")
+    st.caption("You'll be redirected to DeepWalk to authorize access.")
 
 # ── HubSpot helpers ────────────────────────────────────────────────────────────
 def raise_for_status(resp, context=""):
@@ -1835,13 +1865,49 @@ def main():
         st.error("HUBSPOT_ACCESS_TOKEN not set in .env — cannot connect to HubSpot.")
         st.stop()
 
-    # ── Step 1: DeepWalk token (client credentials — no browser redirect) ────────
-    if DW_AUTH0_CLIENT_ID and not st.session_state.get("dw_token"):
-        try:
-            st.session_state["dw_token"] = fetch_dw_token()
-        except Exception as e:
-            st.error(f"Could not obtain DeepWalk API token: {e}")
-            st.stop()
+    # ── Step 1: DeepWalk OAuth gate ───────────────────────────────────────────
+    if DW_AUTH0_CLIENT_ID:
+        params = st.query_params
+
+        # Redirect back from DeepWalk Auth0
+        if "code" in params and params.get("state", "").startswith("dw-") \
+                and not st.session_state.get("dw_authenticated"):
+            code = params["code"]
+            if params.get("state") != _dw_oauth_state():
+                st.error("Invalid state parameter — possible CSRF attempt. Please try again.")
+                st.query_params.clear()
+                st.stop()
+            try:
+                with st.spinner("Signing you in…"):
+                    tokens = dw_exchange_code(code)
+                dw_key = secrets.token_hex(16)
+                _dw_token_store[dw_key] = tokens["access_token"]
+                st.session_state["dw_token"]         = tokens["access_token"]
+                st.session_state["dw_authenticated"] = True
+                st.session_state["dw_session_key"]   = dw_key
+                st.query_params.clear()
+                st.rerun()
+            except Exception as e:
+                st.error(f"DeepWalk authentication failed: {e}")
+                st.query_params.clear()
+                st.stop()
+
+        if not st.session_state.get("dw_authenticated"):
+            # HubSpot callback in progress — try to recover dw_token from store
+            if "code" in params and not params.get("state", "").startswith("dw-"):
+                state_val = params.get("state", "")
+                hmac_part, _, dw_key = state_val.partition(":")
+                if hmac_part == _oauth_state() and dw_key and dw_key in _dw_token_store:
+                    st.session_state["dw_token"]         = _dw_token_store[dw_key]
+                    st.session_state["dw_authenticated"] = True
+                    st.session_state["dw_session_key"]   = dw_key
+                    # fall through to HubSpot gate
+                else:
+                    render_dw_login_page()
+                    st.stop()
+            else:
+                render_dw_login_page()
+                st.stop()
 
     # ── Step 2: HubSpot OAuth gate ────────────────────────────────────────────
     if OAUTH_CLIENT_ID:
@@ -1853,7 +1919,9 @@ def main():
             code           = params["code"]
             returned_state = params.get("state", "")
 
-            if returned_state != _oauth_state():
+            # State may be "hmac" or "hmac:dw_session_key" — validate the HMAC prefix
+            hmac_part = returned_state.partition(":")[0]
+            if hmac_part != _oauth_state():
                 st.error("Invalid state parameter — possible CSRF attempt. Please try again.")
                 st.query_params.clear()
                 st.stop()
@@ -1874,6 +1942,9 @@ def main():
                 st.session_state["authenticated"] = True
                 st.session_state["user_email"]    = user_info.get("user", "")
                 st.session_state["hub_id"]        = hub_id
+                # Clean up server-side dw token store entry
+                dw_key = returned_state.partition(":")[2]
+                _dw_token_store.pop(dw_key, None)
                 st.query_params.clear()
                 st.rerun()
 

@@ -114,9 +114,19 @@ def render_login_page():
     st.caption("You'll be redirected to HubSpot to authorize access.")
 
 # ── DeepWalk OAuth helpers ────────────────────────────────────────────────────
-# Server-side store: dw_session_key -> dw_access_token
-# Survives the HubSpot redirect even when Streamlit session state is lost.
-_dw_token_store: dict = {}
+def _store_dw_token(dw_key: str, token: str):
+    """Persist dw_key->token to disk so it survives process restarts."""
+    state = load_state()
+    state.setdefault("_dw_tokens", {})[dw_key] = token
+    save_state(state)
+
+def _recover_dw_token(dw_key: str) -> str:
+    """Retrieve and remove a dw_token by key from disk."""
+    state = load_state()
+    token = state.get("_dw_tokens", {}).pop(dw_key, "")
+    if token:
+        save_state(state)
+    return token
 
 def _dw_oauth_state() -> str:
     return "dw-" + hashlib.sha256(f"dw-oauth-{DW_AUTH0_CLIENT_SECRET}".encode()).hexdigest()[:28]
@@ -1881,7 +1891,7 @@ def main():
                 with st.spinner("Signing you in…"):
                     tokens = dw_exchange_code(code)
                 dw_key = secrets.token_hex(16)
-                _dw_token_store[dw_key] = tokens["access_token"]
+                _store_dw_token(dw_key, tokens["access_token"])
                 st.session_state["dw_token"]         = tokens["access_token"]
                 st.session_state["dw_authenticated"] = True
                 st.session_state["dw_session_key"]   = dw_key
@@ -1897,8 +1907,9 @@ def main():
             if "code" in params and not params.get("state", "").startswith("dw-"):
                 state_val = params.get("state", "")
                 hmac_part, _, dw_key = state_val.partition(":")
-                if hmac_part == _oauth_state() and dw_key and dw_key in _dw_token_store:
-                    st.session_state["dw_token"]         = _dw_token_store[dw_key]
+                recovered = _recover_dw_token(dw_key) if dw_key else ""
+                if hmac_part == _oauth_state() and recovered:
+                    st.session_state["dw_token"]         = recovered
                     st.session_state["dw_authenticated"] = True
                     st.session_state["dw_session_key"]   = dw_key
                     # fall through to HubSpot gate
@@ -1942,9 +1953,7 @@ def main():
                 st.session_state["authenticated"] = True
                 st.session_state["user_email"]    = user_info.get("user", "")
                 st.session_state["hub_id"]        = hub_id
-                # Clean up server-side dw token store entry
-                dw_key = returned_state.partition(":")[2]
-                _dw_token_store.pop(dw_key, None)
+                # dw token already removed from disk by _recover_dw_token above
                 st.query_params.clear()
                 st.rerun()
 

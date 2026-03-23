@@ -468,22 +468,51 @@ def fetch_mileage_invoiced_for_deal(deal_id: str, mileage_names: tuple) -> tuple
     return billed, paid
 
 
+_EXCLUDED_STAGES = {"archive", "rescan"}
+
+
+def _parse_project_ids(project_id_str: str) -> list[int]:
+    """Parse a comma-separated string of project IDs into a list of ints."""
+    if not project_id_str:
+        return []
+    ids = []
+    for part in project_id_str.split(","):
+        part = part.strip()
+        try:
+            ids.append(int(part))
+        except ValueError:
+            pass
+    return ids
+
+
 @st.cache_data(ttl=300)
-def fetch_collected_miles_cached(project_id: int, dw_token: str) -> float:
-    """Fetch total collected (non-archived) miles from DeepWalk API. Token passed as param for caching."""
+def fetch_mileage_by_stage_cached(project_id: int, dw_token: str) -> dict:
+    """Fetch {stage: miles} from DeepWalk API. Token passed as param for cache key."""
     if not dw_token or not project_id:
-        return 0.0
+        return {}
     try:
         resp = requests.get(
             f"https://app.deepwalkresearch.com/api/project/{project_id}/mileage/detailed",
             headers={"Authorization": f"Bearer {dw_token}"},
         )
         if not resp.ok:
-            return 0.0
-        miles_by_stage = {str(k): float(v) for k, v in resp.json().items() if v is not None}
-        return sum(v for k, v in miles_by_stage.items() if k not in _EXCLUDED_STAGES)
+            return {}
+        return {str(k): float(v) for k, v in resp.json().items() if v is not None}
     except Exception:
-        return 0.0
+        return {}
+
+
+@st.cache_data(ttl=300)
+def fetch_collected_miles_cached(project_id: int, dw_token: str) -> float:
+    """Fetch total collected (non-archived) miles from DeepWalk API."""
+    miles = fetch_mileage_by_stage_cached(project_id, dw_token)
+    return sum(v for k, v in miles.items() if k not in _EXCLUDED_STAGES)
+
+
+@st.cache_data(ttl=300)
+def fetch_passed_miles_cached(project_id: int, dw_token: str) -> float:
+    """Fetch miles in the 'passed' stage from DeepWalk API."""
+    return fetch_mileage_by_stage_cached(project_id, dw_token).get("passed", 0.0)
 
 
 # ── Pipeline stages ────────────────────────────────────────────────────────────
@@ -666,17 +695,19 @@ def get_deal_mileage_summary(deal: dict, state: dict) -> dict | None:
 
     project_id_str = (deal.get("properties", {}).get("project_id") or "").strip()
     collected = 0.0
-    if project_id_str:
+    passed    = 0.0
+    dw_token  = st.session_state.get("dw_token", "")
+    for pid in _parse_project_ids(project_id_str):
         try:
-            collected = fetch_collected_miles_cached(
-                int(project_id_str), st.session_state.get("dw_token", "")
-            )
-        except (ValueError, Exception):
-            collected = 0.0
+            collected += fetch_collected_miles_cached(pid, dw_token)
+            passed    += fetch_passed_miles_cached(pid, dw_token)
+        except Exception:
+            pass
 
     return {
         "contracted": contracted,
         "collected":  collected,
+        "passed":     passed,
         "billed":     billed,
         "paid":       paid,
     }
@@ -1098,6 +1129,7 @@ def render_summary(deals: list[dict], state: dict):
                 "project_id":       p.get("project_id", ""),
                 "mi_contracted":    mi_summary["contracted"] if mi_summary else None,
                 "mi_collected":     mi_summary["collected"]  if mi_summary else None,
+                "mi_passed":        mi_summary["passed"]     if mi_summary else None,
                 "mi_billed":        mi_summary["billed"]     if mi_summary else None,
                 "mi_paid":          mi_summary["paid"]       if mi_summary else None,
             })
@@ -1139,6 +1171,7 @@ def render_summary(deals: list[dict], state: dict):
         if has_mileage:
             row["Contracted Mi"] = dd["mi_contracted"] if dd["mi_contracted"] is not None else 0.0
             row["Collected Mi"]  = dd["mi_collected"]  if dd["mi_collected"]  is not None else 0.0
+            row["Passed Mi"]     = dd["mi_passed"]     if dd["mi_passed"]     is not None else 0.0
             row["Billed Mi"]     = dd["mi_billed"]     if dd["mi_billed"]     is not None else 0.0
             row["Paid Mi"]       = dd["mi_paid"]       if dd["mi_paid"]       is not None else 0.0
         df_rows.append(row)
@@ -1156,6 +1189,7 @@ def render_summary(deals: list[dict], state: dict):
     if has_mileage:
         col_config["Contracted Mi"] = st.column_config.NumberColumn("Contracted Mi", format="%.1f mi")
         col_config["Collected Mi"]  = st.column_config.NumberColumn("Collected Mi",  format="%.1f mi")
+        col_config["Passed Mi"]     = st.column_config.NumberColumn("Passed Mi",     format="%.1f mi")
         col_config["Billed Mi"]     = st.column_config.NumberColumn("Billed Mi",     format="%.1f mi")
         col_config["Paid Mi"]       = st.column_config.NumberColumn("Paid Mi",       format="%.1f mi")
 
@@ -1505,12 +1539,12 @@ def render_create_invoice_tab(deal_id: str, line_items: list[dict], state: dict)
             ).strip()
             _collected_mi = 0.0
             if _project_id_str:
-                try:
-                    _collected_mi = fetch_collected_miles_cached(
-                        int(_project_id_str), st.session_state.get("dw_token", "")
-                    )
-                except (ValueError, Exception):
-                    _collected_mi = 0.0
+                _dw_token = st.session_state.get("dw_token", "")
+                for _pid in _parse_project_ids(_project_id_str):
+                    try:
+                        _collected_mi += fetch_collected_miles_cached(_pid, _dw_token)
+                    except Exception:
+                        pass
             st.markdown(f"**{name}** — Mileage  (${unit_p:,.4f}/mile)")
             _caption_parts = [
                 f"Contracted: {contracted:g} mi",
@@ -1975,10 +2009,7 @@ def render_drafts_view(deal_lookup: dict):
                 _render_draft_invoice_row(draft)
 
 
-# ── DeepWalk API: mileage fetch ────────────────────────────────────────────────
-_EXCLUDED_STAGES = {"archive", "rescan"}
-
-
+# ── DeepWalk API: scan progress fetch ─────────────────────────────────────────
 def fetch_scan_miles_by_stage(project_id: int) -> dict:
     """Returns {stage: miles} for all scans in the project via DeepWalk API."""
     token = st.session_state.get("dw_token", "")
@@ -2007,7 +2038,7 @@ def render_scan_progress(deals: list[dict]):
 
     deals_with_project = [
         d for d in deals
-        if (d.get("properties", {}).get("project_id") or "").strip()
+        if _parse_project_ids((d.get("properties", {}).get("project_id") or "").strip())
     ]
 
     if not deals_with_project:
@@ -2020,49 +2051,53 @@ def render_scan_progress(deals: list[dict]):
         p              = d.get("properties", {})
         deal_name      = p.get("dealname") or d["id"]
         project_id_str = (p.get("project_id") or "").strip()
+        project_ids    = _parse_project_ids(project_id_str)
 
-        try:
-            project_id = int(project_id_str)
-        except (ValueError, TypeError):
+        if not project_ids:
             continue
 
-        with st.expander(f"**{deal_name}** — Project #{project_id}", expanded=True):
-            try:
-                with st.spinner("Loading scan data…"):
-                    miles_by_stage = fetch_scan_miles_by_stage(project_id)
-            except Exception as e:
-                st.warning(f"Could not load scan data: {e}")
+        label = f"**{deal_name}** — Project{'s' if len(project_ids) > 1 else ''} #{', #'.join(str(pid) for pid in project_ids)}"
+        with st.expander(label, expanded=True):
+            for project_id in project_ids:
+                if len(project_ids) > 1:
+                    st.markdown(f"*Project #{project_id}*")
+
+                try:
+                    with st.spinner("Loading scan data…"):
+                        miles_by_stage = fetch_scan_miles_by_stage(project_id)
+                except Exception as e:
+                    st.warning(f"Could not load scan data: {e}")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Collected",  "—")
+                    c2.metric("In Progress", "—")
+                    c3.metric("Completed",  "—")
+                    continue
+
+                if not miles_by_stage:
+                    st.info("No scan data found for this project.")
+                    continue
+
+                visible = {k: v for k, v in miles_by_stage.items() if k not in _EXCLUDED_STAGES}
+                collected_miles   = sum(visible.values())
+                completed_miles   = visible.get("passed", 0.0)
+                in_progress_miles = collected_miles - completed_miles
+
                 c1, c2, c3 = st.columns(3)
-                c1.metric("Collected",  "—")
-                c2.metric("In Progress", "—")
-                c3.metric("Completed",  "—")
-                continue
+                c1.metric("Collected",   f"{collected_miles:.2f} mi")
+                c2.metric("In Progress", f"{in_progress_miles:.2f} mi")
+                pct = f"{completed_miles / collected_miles * 100:.0f}% of collected" if collected_miles else None
+                c3.metric("Completed",   f"{completed_miles:.2f} mi", delta=pct)
 
-            if not miles_by_stage:
-                st.info("No scan data found for this project.")
-                continue
-
-            visible = {k: v for k, v in miles_by_stage.items() if k not in _EXCLUDED_STAGES}
-            collected_miles  = sum(visible.values())
-            completed_miles  = visible.get("passed", 0.0)
-            in_progress_miles = collected_miles - completed_miles
-
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Collected",   f"{collected_miles:.2f} mi")
-            c2.metric("In Progress", f"{in_progress_miles:.2f} mi")
-            pct = f"{completed_miles / collected_miles * 100:.0f}% of collected" if collected_miles else None
-            c3.metric("Completed",   f"{completed_miles:.2f} mi", delta=pct)
-
-            with st.expander("Stage breakdown", expanded=False):
-                rows = [
-                    {
-                        "Stage":    stage,
-                        "Miles":    f"{miles:.2f}",
-                        "Category": "Completed" if stage == "passed" else "In Progress",
-                    }
-                    for stage, miles in sorted(visible.items(), key=lambda x: -x[1])
-                ]
-                st.dataframe(rows, use_container_width=True, hide_index=True)
+                with st.expander("Stage breakdown", expanded=False):
+                    rows = [
+                        {
+                            "Stage":    stage,
+                            "Miles":    f"{miles:.2f}",
+                            "Category": "Completed" if stage == "passed" else "In Progress",
+                        }
+                        for stage, miles in sorted(visible.items(), key=lambda x: -x[1])
+                    ]
+                    st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
 # ── Main app ───────────────────────────────────────────────────────────────────

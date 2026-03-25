@@ -555,7 +555,7 @@ def create_invoice_in_hubspot(deal_id: str, line_items_to_bill: list[dict],
         "hs_currency": "USD",
     }
     if memo:
-        inv_props["hs_note"] = memo
+        inv_props["hs_comments"] = memo
     inv_resp = requests.post(
         f"{BASE_URL}/crm/v3/objects/invoices",
         headers=HEADERS,
